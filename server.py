@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "3.5 от 12.10.2026"
+VERSION = "3.6 от 12.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -999,6 +999,9 @@ document.addEventListener('mousedown',e=>{
   if(editing && editing.r===rc.r && editing.c===rc.c) return; // редактируем — обычный клик
   e.preventDefault();
   if(editing){document.activeElement.blur();editing=null;}
+  if(e.shiftKey && sel){                     // Shift+клик: расширить диапазон, как в Excel
+    sel.f=rc; dragging=true; applySel(); return;
+  }
   sel={a:rc,f:rc}; dragging=true; applySel();
 });
 document.addEventListener('mouseover',e=>{
