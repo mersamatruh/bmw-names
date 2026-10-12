@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "3.6 от 12.10.2026"
+VERSION = "3.7 от 12.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -1136,6 +1136,12 @@ document.addEventListener('keydown',e=>{
 
 // Вставка из Excel: заполняем начиная с ячейки, куда вставили (как в Excel)
 const COLS=['art','short','base','models','name'];
+function cleanVal(col, v){
+  // убрать управляющие и невидимые символы (из Excel/PDF часто тянутся)
+  v=String(v).replace(/[\u0000-\u001f\u007f\u00a0\u00ad\u200b-\u200f\u2028\u2029\ufeff]/g,' ');
+  if(col==='art') return v.toUpperCase().replace(/[^A-Z0-9]/g,'');  // артикул: строго A-Z 0-9
+  return v.replace(/\s+/g,' ').trim();
+}
 const WRITE=['art','base','models','name'];   // 'short' вычисляется, в него не пишем
 document.addEventListener('paste',e=>{
   if(e.target && e.target.classList && e.target.classList.contains('nameedit')) return;
@@ -1143,7 +1149,33 @@ document.addEventListener('paste',e=>{
   if(!t) return;
   const lines=t.replace(/\r/g,'').split('\n').filter((x,idx,arr)=>x.trim()||idx<arr.length-1);
   const multi = t.includes('\t') || lines.length>1;
-  if(!multi) return;                       // одиночное значение — обычная вставка в ячейку
+  if(!multi){
+    // одиночное значение
+    const edCell=e.target.closest && e.target.closest('#tb td[data-f]');
+    if(edCell && editing){
+      // правка внутри ячейки: вставить как чистый текст, без форматирования
+      e.preventDefault();
+      document.execCommand('insertText', false, cleanVal(edCell.dataset.f, t));
+      return;
+    }
+    if(!sel) return;
+    // ячейка просто выделена мышью: вставляем прямо в неё (и во весь диапазон)
+    e.preventDefault();
+    const R=selRect(); if(!R) return;
+    for(let r=R.r1;r<=R.r2;r++){
+      while(rows.length<=r) rows.push(emptyRow());
+      for(let c=R.c1;c<=R.c2;c++){
+        const col=COLS[c];
+        if(col==='short') continue;
+        rows[r][col]=cleanVal(col, t);
+        rows[r]._dirty=true; rows[r]._pin=true;
+        if(rows[r].status==='err' && col!=='name'){rows[r].status='wait'; rows[r].why='';}
+        if(rows[r].status==='done' && (col==='art'||col==='base')) rows[r].status='wait';
+      }
+    }
+    render(); fillFromCatalog();
+    return;
+  }
   e.preventDefault();
   // куда вставили: если в ячейку таблицы — стартуем с её строки и столбца
   let startRow=rows.length, startCol=0;
@@ -1163,7 +1195,7 @@ document.addEventListener('paste',e=>{
     while(rows.length<=ri) rows.push(emptyRow());
     line.split('\t').forEach((val,ci)=>{
       const col=WRITE[startCol+ci];
-      if(col) rows[ri][col]=val.trim();
+      if(col) rows[ri][col]=cleanVal(col, val);
     });
     if(rows[ri].status==='done'&&startCol<=1) rows[ri].status='wait';
   });
