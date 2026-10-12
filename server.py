@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "3.4 от 12.10.2026"
+VERSION = "3.5 от 12.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -820,8 +820,6 @@ PAGE = r"""<!doctype html>
     <button id="btnCat" title="Загрузить справочник артикул → базовое название (xlsx/csv)">Справочник…</button>
     <input type="file" id="catFile" accept=".xlsx,.xls,.csv,.txt" style="display:none">
     <button id="btnGh" title="Скачать и установить свежую версию из GitHub">Обновить с GitHub</button>
-    <button id="btnCode" title="Загрузить новую версию (server.py или zip) и перезапустить">Обновить сервер…</button>
-    <input type="file" id="codeFile" accept=".py,.zip" style="display:none">
     <span class="hint">Ctrl+V — вставка (можно только артикулы: названия подтянутся из справочника) · Ctrl+C — копия · двойной клик — правка</span>
   </div>
   <table id="tbl">
@@ -1353,21 +1351,7 @@ $('#btnGh').onclick=async()=>{
   alert('Обновление установлено. Сервер перезапускается, страница обновится через 6 секунд.');
   setTimeout(()=>location.reload(),6000);
 };
-$('#btnCode').onclick=()=>$('#codeFile').click();
-$('#codeFile').onchange=async e=>{
-  const f=e.target.files[0]; e.target.value='';
-  if(!f) return;
-  if(!confirm('Заменить код сервера файлом «'+f.name+'» и перезапустить? Текущая версия сохранится как server.py.bak')) return;
-  const fd=new FormData(); fd.append('file',f);
-  let d={};
-  try{
-    const res=await fetch('/api/update_code',{method:'POST',headers:{'X-Auth':AUTH},body:fd});
-    d=await res.json();
-  }catch(err){ d={error:String(err)}; }
-  if(d.error){alert('Ошибка: '+d.error);return;}
-  alert('Код принят. Сервер перезапускается, страница обновится через 6 секунд.');
-  setTimeout(()=>location.reload(),6000);
-};
+
 $('#catFile').onchange=e=>{ if(e.target.files[0]){uploadCatalog(e.target.files[0]); e.target.value='';} };
 
 async function fillFromCatalog(){
