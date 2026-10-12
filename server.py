@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "3.7 от 12.10.2026"
+VERSION = "3.8 от 12.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -807,11 +807,11 @@ PAGE = r"""<!doctype html>
 <main>
   <div class="bar">
     <button class="primary" id="btnGen">Сгенерировать названия</button>
-    <button id="btnAdd">Добавить строку</button>
+    <button id="btnAdd" style="display:none">Добавить строку</button>
     <button id="btnStop" style="display:none">Стоп</button>
     <button id="btnSeo" title="Сгенерировать SEO-описания для готовых строк без описания">Сгенерировать SEO</button>
     <button id="btnCopyRes" title="Скопировать артикулы и наименования для вставки в Excel">Скопировать результат</button>
-    <button id="btnCsv">Скачать CSV</button>
+    <button id="btnCsv" style="display:none">Скачать CSV</button>
     <button id="btnClear">Новая партия</button>
     <select id="snaps" style="padding:8px;border:1px solid var(--line);border-radius:6px;font:inherit;max-width:260px">
       <option value="">— слепки —</option></select>
