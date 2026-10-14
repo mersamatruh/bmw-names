@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "2.0 от 14.10.2026"
+VERSION = "2.1 от 14.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -815,6 +815,18 @@ PAGE = r"""<!doctype html>
           display:flex;gap:8px;padding:8px}
     .side .navitem{margin-bottom:0}
   }
+  /* --- раздел «Бот напоминатель» --- */
+  #remName{flex:1;min-width:220px;padding:8px 10px;border:1px solid var(--line);
+           border-radius:6px;font:inherit}
+  #remPeriod{width:130px;padding:8px 10px;border:1px solid var(--line);
+             border-radius:6px;font:inherit}
+  .remcard{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+           padding:11px 14px;margin-bottom:8px;display:flex;align-items:center;
+           gap:12px;max-width:720px}
+  .remcard .nm{font-weight:600}
+  .remcard .pd{color:var(--mut);font-size:13px}
+  .remcard .sp{flex:1}
+  .remcard.arch{opacity:.65}
 </style>
 </head>
 <body>
@@ -876,14 +888,19 @@ PAGE = r"""<!doctype html>
   </table>
 </main>
 <main id="sec-bot" style="display:none">
-  <div class="panel">
-    <h2 style="margin:0 0 8px">🔔 Бот напоминатель</h2>
-    <p class="hint" style="margin:0 0 14px">Раздел в разработке. Здесь появятся напоминания
-      о регулярных платежах: список, окна напоминаний и отметки «оплачено».</p>
-    <p class="hint" style="margin:0">Данными управляет телеграм-бот на сервере. Следующий
-      шаг — подключить эту панель к его API, чтобы добавлять напоминания и видеть статусы
-      прямо здесь.</p>
+  <h2 style="margin:0 0 4px">🔔 Бот напоминатель</h2>
+  <p class="hint" style="margin:0 0 14px">Регулярные платежи. Укажи название и окно дней
+    месяца, когда напоминать, — бот будет напоминать каждое утро, пока платёж не отмечен.</p>
+  <div class="bar">
+    <input id="remName" placeholder="Название — напр. Электроэнергия"
+           onkeydown="if(event.key==='Enter')addReminder()">
+    <input id="remPeriod" placeholder="Окно: 1-14"
+           onkeydown="if(event.key==='Enter')addReminder()">
+    <button class="primary" onclick="addReminder()">Добавить напоминание</button>
+    <span class="hint">Окно — дни месяца. Пример: <b>1-14</b>. Один день — просто <b>10</b>.</span>
   </div>
+  <div id="remMsg" class="hint" style="margin-bottom:10px;color:var(--err)"></div>
+  <div id="remList"></div>
 </main>
   </div><!-- .content -->
 </div><!-- .layout -->
@@ -1255,6 +1272,69 @@ async function apiGet(path){
   return res.json();
 }
 
+/* ---- раздел «Бот напоминатель» ---- */
+function remEsc(s){return (s+'').replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function remPeriodStr(s,e){return s===e?(s+' числа'):('с '+s+' по '+e+' число');}
+function parseRemPeriod(t){
+  t=(t||'').replace(/[—–]/g,'-').trim();
+  var parts = t.indexOf('-')>=0 ? t.split('-') : t.split(/\s+/);
+  var nums=[];
+  for(var i=0;i<parts.length;i++){var x=parts[i].trim();
+    if(x!==''){ if(!/^\d+$/.test(x)) return null; nums.push(parseInt(x,10)); }}
+  var s,e;
+  if(nums.length===1){s=e=nums[0];}
+  else if(nums.length===2){s=nums[0];e=nums[1];}
+  else return null;
+  if(!(s>=1&&s<=31&&e>=1&&e<=31)||s>e) return null;
+  return [s,e];
+}
+async function loadReminders(){
+  var box=document.getElementById('remList'); if(!box) return;
+  box.innerHTML='<div class="hint">Загрузка…</div>';
+  try{ var d=await apiGet('/api/reminders'); renderReminders(d.reminders||[]); }
+  catch(e){ box.innerHTML='<div class="hint">Не удалось загрузить список.</div>'; }
+}
+function renderReminders(items){
+  var box=document.getElementById('remList'); if(!box) return;
+  var act=items.filter(function(r){return r.active;});
+  var arch=items.filter(function(r){return !r.active;});
+  var html='';
+  if(!act.length && !arch.length) html='<div class="hint">Пока нет ни одного напоминания.</div>';
+  act.forEach(function(r){
+    html+='<div class="remcard"><span class="nm">🔔 '+remEsc(r.name)+'</span>'
+      +'<span class="pd">'+remPeriodStr(r.start,r.end)+'</span><span class="sp"></span>'
+      +'<button onclick="archiveReminder('+r.id+',false)">📦 В архив</button></div>';
+  });
+  if(arch.length){
+    html+='<div class="hint" style="margin:14px 0 6px">Архив</div>';
+    arch.forEach(function(r){
+      html+='<div class="remcard arch"><span class="nm">'+remEsc(r.name)+'</span>'
+        +'<span class="pd">'+remPeriodStr(r.start,r.end)+'</span><span class="sp"></span>'
+        +'<button onclick="archiveReminder('+r.id+',true)">↩️ Вернуть</button></div>';
+    });
+  }
+  box.innerHTML=html;
+}
+async function addReminder(){
+  var nm=document.getElementById('remName'), pd=document.getElementById('remPeriod'),
+      msg=document.getElementById('remMsg');
+  var name=(nm.value||'').trim();
+  var per=parseRemPeriod(pd.value);
+  if(!name){ msg.textContent='Впишите название.'; return; }
+  if(!per){ msg.textContent='Окно неверное. Пример: 1-14 или одно число 10 (дни 1–31).'; return; }
+  msg.textContent='';
+  try{
+    var r=await api('/api/reminder_add',{name:name,start:per[0],end:per[1]});
+    if(r && r.error){ msg.textContent=r.error; return; }
+    nm.value=''; pd.value=''; loadReminders();
+  }catch(e){ msg.textContent='Не удалось сохранить.'; }
+}
+async function archiveReminder(id, active){
+  try{ await api('/api/reminder_archive',{id:id,active:active}); loadReminders(); }
+  catch(e){}
+}
+
 let jobId=null, pollTimer=null, pendingSrv=null;
 
 function setRunning(on){
@@ -1488,6 +1568,7 @@ if(!NEED_PW || AUTH) init();
     for(var k in secs){ if(secs[k]) secs[k].style.display = (k===sec ? '' : 'none'); }
     items.forEach(function(b){ b.classList.toggle('active', b.dataset.sec===sec); });
     try{ localStorage.setItem('section', sec); }catch(e){}
+    if(sec==='bot' && typeof loadReminders==='function') loadReminders();
   }
   items.forEach(function(b){ b.addEventListener('click', function(){ show(b.dataset.sec); }); });
   var saved=null;
@@ -1497,6 +1578,103 @@ if(!NEED_PW || AUTH) init();
 </script>
 </body>
 </html>"""
+
+
+REMINDERS_PATH = "reminders.json"
+
+
+def load_reminders():
+    if os.path.exists(REMINDERS_PATH):
+        try:
+            with open(REMINDERS_PATH, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"seq": 0, "items": []}
+
+
+def save_reminders(data):
+    with open(REMINDERS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+@app.get("/api/reminders")
+def api_reminders():
+    if not check_auth(request):
+        return jsonify({"error": "Неверный пароль"}), 401
+    return jsonify({"reminders": load_reminders()["items"]})
+
+
+@app.post("/api/reminder_add")
+def api_reminder_add():
+    if not check_auth(request):
+        return jsonify({"error": "Неверный пароль"}), 401
+    d = request.get_json(force=True)
+    name = str(d.get("name", "")).strip()
+    try:
+        start = int(d.get("start"))
+        end = int(d.get("end"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Неверное окно"}), 400
+    if not name:
+        return jsonify({"error": "Нужно название"}), 400
+    if not (1 <= start <= 31 and 1 <= end <= 31) or start > end:
+        return jsonify({"error": "Окно: дни 1–31, начало не позже конца"}), 400
+    with lock:
+        data = load_reminders()
+        data["seq"] += 1
+        item = {"id": data["seq"], "name": name, "start": start,
+                "end": end, "active": True}
+        data["items"].append(item)
+        save_reminders(data)
+    return jsonify({"ok": True, "reminder": item})
+
+
+@app.post("/api/reminder_archive")
+def api_reminder_archive():
+    if not check_auth(request):
+        return jsonify({"error": "Неверный пароль"}), 401
+    d = request.get_json(force=True)
+    rid = d.get("id")
+    active = bool(d.get("active"))
+    found = False
+    with lock:
+        data = load_reminders()
+        for it in data["items"]:
+            if it["id"] == rid:
+                it["active"] = active
+                found = True
+                break
+        if found:
+            save_reminders(data)
+    return jsonify({"ok": found})
+
+
+@app.post("/api/reminder_period")
+def api_reminder_period():
+    if not check_auth(request):
+        return jsonify({"error": "Неверный пароль"}), 401
+    d = request.get_json(force=True)
+    rid = d.get("id")
+    try:
+        start = int(d.get("start"))
+        end = int(d.get("end"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Неверное окно"}), 400
+    if not (1 <= start <= 31 and 1 <= end <= 31) or start > end:
+        return jsonify({"error": "Окно: дни 1–31, начало не позже конца"}), 400
+    found = False
+    with lock:
+        data = load_reminders()
+        for it in data["items"]:
+            if it["id"] == rid:
+                it["start"] = start
+                it["end"] = end
+                found = True
+                break
+        if found:
+            save_reminders(data)
+    return jsonify({"ok": found})
 
 
 @app.get("/")
