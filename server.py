@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "2.1 от 14.10.2026"
+VERSION = "2.2 от 14.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -1584,13 +1584,17 @@ REMINDERS_PATH = "reminders.json"
 
 
 def load_reminders():
+    data = {"seq": 0, "items": [], "marks": []}
     if os.path.exists(REMINDERS_PATH):
         try:
             with open(REMINDERS_PATH, encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except Exception:
             pass
-    return {"seq": 0, "items": []}
+    data.setdefault("seq", 0)
+    data.setdefault("items", [])
+    data.setdefault("marks", [])  # [{rid, period "YYYY-MM", at, by}]
+    return data
 
 
 def save_reminders(data):
@@ -1675,6 +1679,63 @@ def api_reminder_period():
         if found:
             save_reminders(data)
     return jsonify({"ok": found})
+
+
+@app.get("/api/marks")
+def api_marks():
+    if not check_auth(request):
+        return jsonify({"error": "Неверный пароль"}), 401
+    period = request.args.get("period", "")
+    marks = load_reminders()["marks"]
+    paid = [m["rid"] for m in marks if m.get("period") == period]
+    return jsonify({"period": period, "paid": paid})
+
+
+@app.post("/api/mark")
+def api_mark():
+    if not check_auth(request):
+        return jsonify({"error": "Неверный пароль"}), 401
+    d = request.get_json(force=True)
+    try:
+        rid = int(d.get("rid"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Нужен rid"}), 400
+    period = str(d.get("period", "")).strip()
+    by = str(d.get("by", "")).strip()
+    if not re.fullmatch(r"\d{4}-\d{2}", period):
+        return jsonify({"error": "Неверный период"}), 400
+    with lock:
+        data = load_reminders()
+        already = any(m["rid"] == rid and m["period"] == period for m in data["marks"])
+        if not already:
+            data["marks"].append({
+                "rid": rid, "period": period,
+                "at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "by": by,
+            })
+            save_reminders(data)
+    return jsonify({"ok": True, "already": already})
+
+
+@app.post("/api/unmark")
+def api_unmark():
+    if not check_auth(request):
+        return jsonify({"error": "Неверный пароль"}), 401
+    d = request.get_json(force=True)
+    try:
+        rid = int(d.get("rid"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Нужен rid"}), 400
+    period = str(d.get("period", "")).strip()
+    with lock:
+        data = load_reminders()
+        before = len(data["marks"])
+        data["marks"] = [m for m in data["marks"]
+                         if not (m["rid"] == rid and m["period"] == period)]
+        removed = before - len(data["marks"])
+        if removed:
+            save_reminders(data)
+    return jsonify({"ok": bool(removed)})
 
 
 @app.get("/")
