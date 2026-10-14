@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "3.8 от 12.10.2026"
+VERSION = "2.0 от 14.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -797,6 +797,24 @@ PAGE = r"""<!doctype html>
                font:inherit;margin:10px 0}
   .empty td{color:var(--mut);text-align:center;padding:28px}
   @media (max-width:800px){ .hide-m{display:none} }
+  /* --- боковое меню разделов (v2.0) --- */
+  .layout{display:flex;align-items:flex-start}
+  .side{width:214px;flex:none;background:var(--panel);border-right:1px solid var(--line);
+        min-height:calc(100vh - 51px);padding:14px 10px}
+  .side .navitem{display:block;width:100%;text-align:left;padding:10px 12px;margin-bottom:4px;
+        border:1px solid transparent;border-radius:8px;background:none;color:var(--ink);
+        font:inherit;cursor:pointer}
+  .side .navitem:hover{background:var(--bg)}
+  .side .navitem.active{background:#eaf1fc;border-color:var(--blue);color:var(--blue);font-weight:600}
+  .content{flex:1;min-width:0}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+         padding:22px;max-width:720px}
+  @media (max-width:800px){
+    .layout{flex-direction:column}
+    .side{width:auto;min-height:0;border-right:none;border-bottom:1px solid var(--line);
+          display:flex;gap:8px;padding:8px}
+    .side .navitem{margin-bottom:0}
+  }
 </style>
 </head>
 <body>
@@ -804,7 +822,13 @@ PAGE = r"""<!doctype html>
   <h1>Каталог BMW · генератор наименований</h1>
   <span class="sub">эталонов в базе: <b id="refcount">—</b> · справочник: <b id="catcount">—</b> · расход: <b id="spend">—</b> · версия {{ version }}</span>
 </header>
-<main>
+<div class="layout">
+  <nav class="side">
+    <button class="navitem active" data-sec="names">📝 Названия</button>
+    <button class="navitem" data-sec="bot">🔔 Бот напоминатель</button>
+  </nav>
+  <div class="content">
+<main id="sec-names">
   <div class="bar">
     <button class="primary" id="btnGen">Сгенерировать названия</button>
     <button id="btnAdd" style="display:none">Добавить строку</button>
@@ -851,6 +875,18 @@ PAGE = r"""<!doctype html>
     <tbody id="tb"></tbody>
   </table>
 </main>
+<main id="sec-bot" style="display:none">
+  <div class="panel">
+    <h2 style="margin:0 0 8px">🔔 Бот напоминатель</h2>
+    <p class="hint" style="margin:0 0 14px">Раздел в разработке. Здесь появятся напоминания
+      о регулярных платежах: список, окна напоминаний и отметки «оплачено».</p>
+    <p class="hint" style="margin:0">Данными управляет телеграм-бот на сервере. Следующий
+      шаг — подключить эту панель к его API, чтобы добавлять напоминания и видеть статусы
+      прямо здесь.</p>
+  </div>
+</main>
+  </div><!-- .content -->
+</div><!-- .layout -->
 
 <div id="login" style="display:none">
   <div class="box">
@@ -1441,6 +1477,23 @@ $('#btnCsv').onclick=()=>{
 $('#refcount').textContent='{{ refcount }}';
 render();
 if(!NEED_PW || AUTH) init();
+</script>
+<script>
+/* переключение разделов левого меню (v2.0) */
+(function(){
+  var items = document.querySelectorAll('.side .navitem');
+  var secs = { names: document.getElementById('sec-names'),
+               bot:   document.getElementById('sec-bot') };
+  function show(sec){
+    for(var k in secs){ if(secs[k]) secs[k].style.display = (k===sec ? '' : 'none'); }
+    items.forEach(function(b){ b.classList.toggle('active', b.dataset.sec===sec); });
+    try{ localStorage.setItem('section', sec); }catch(e){}
+  }
+  items.forEach(function(b){ b.addEventListener('click', function(){ show(b.dataset.sec); }); });
+  var saved=null;
+  try{ saved = localStorage.getItem('section'); }catch(e){}
+  if(saved && secs[saved]) show(saved);
+})();
 </script>
 </body>
 </html>"""
