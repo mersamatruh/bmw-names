@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "2.2 от 14.10.2026"
+VERSION = "2.3 от 14.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -1145,8 +1145,10 @@ document.addEventListener('focusout',e=>{
 });
 function selText(){
   const R=selRect(); if(!R) return null;
+  const active=Object.values(filters).some(v=>v);
   const lines=[];
   for(let r=R.r1;r<=R.r2;r++){
+    if(active && rows[r] && !rowVisible(rows[r])) continue;  // скрытые фильтром — не копируем
     const vals=[];
     for(let c=R.c1;c<=R.c2;c++) vals.push(rows[r]?cellVal(rows[r],COLS[c]):'');
     lines.push(vals.join('\t'));
