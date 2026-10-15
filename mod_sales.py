@@ -25,11 +25,13 @@ import datetime
 
 # Колонки, которые хранятся в строке (наименование, «общие продажи»
 # и «в заказ» вычисляются и не хранятся).
-TEXT_FIELDS = ("art", "repl", "comment", "order_reason")
+TEXT_FIELDS = ("art", "repl", "comment", "order_reason",
+               "order_ai_why", "order_ai_sig")  # пояснение ИИ и «отпечаток» данных строки
 NUM_FIELDS = ("profit", "turn_de", "sold_de", "sold_sup", "sold_stock",
               "stock", "ordered", "transit", "year",
               "order_manual",  # «в заказ», исправленное вручную
-              "order_ok")      # одобренное (✓) расчётное количество
+              "order_ok",      # одобренное (✓) расчётное количество
+              "order_ai")      # «в заказ», пересчитанное ИИ по методичке
 
 # Кириллица, похожая на латиницу, — чтобы «А123» с русской раскладки
 # не превращался в другой артикул.
@@ -224,10 +226,11 @@ def register(ctx):
                "name": str(d.get("name") or "")[:300],
                "calc": parse_num(d.get("calc")), "manual": parse_num(d.get("manual")),
                "kind": "approved" if approved else "corrected",
+               "source": "ai" if d.get("ai") else "formula",   # чьё число было расчётом
                "reason": reason, "period": d.get("period") or {},
                "cover": parse_num(d.get("cover")),
                "row": {k: parse_num((d.get("row") or {}).get(k)) for k in NUM_FIELDS
-                       if k not in ("order_manual", "order_ok")}}
+                       if k not in ("order_manual", "order_ok", "order_ai")}}
         with lock:
             lessons = load_json(LESSONS_PATH, [])
             for old in lessons:
@@ -245,6 +248,94 @@ def register(ctx):
                 lessons.append(rec)
             save_json(LESSONS_PATH, lessons)
         return jsonify({"ok": True, "lessons_count": len(lessons)})
+
+    # ---------- Пересчёт «В заказ» ИИ по методичке ----------
+
+    AI_FIELDS = (("profit", "прибыль склад"), ("turn_de", "оборот Герм."),
+                 ("sold_de", "продано Герм."), ("sold_sup", "продано поставщики"),
+                 ("sold_stock", "продано склад"), ("total", "общие продажи за период"),
+                 ("stock", "наличие"), ("ordered", "заказано"), ("transit", "в пути"),
+                 ("year", "продажи за 365 дн."), ("calc", "формула"))
+
+    def ai_line(x):
+        return "; ".join(f"{t}={x.get(k)}" for k, t in AI_FIELDS
+                         if x.get(k) not in (None, ""))
+
+    @app.post("/api/sales_ai")
+    def api_sales_ai():
+        """Пачка строк → количество «в заказ» по правилам из методички."""
+        if not check_auth(request):
+            return deny()
+        client, model = ctx.get("client"), ctx.get("model")
+        if client is None or not model:
+            return jsonify({"error": "ИИ недоступен на сервере"}), 500
+        d = request.get_json(force=True) or {}
+        rows = (d.get("rows") or [])[:60]
+        if not rows:
+            return jsonify({"error": "Нет строк"}), 400
+        lessons = sorted(load_json(LESSONS_PATH, []),
+                         key=lambda x: x.get("updated") or x.get("at") or "")[-150:]
+        if not lessons:
+            return jsonify({"error": "Методичка пуста — сначала одобрите ✓ "
+                                     "или исправьте ✎ несколько строк"}), 400
+        les_txt = []
+        for x in lessons:
+            row = dict(x.get("row") or {})
+            row["calc"] = x.get("calc")
+            per = x.get("period") or {}
+            kind = "ОДОБРЕНО" if x.get("kind") == "approved" else "ИСПРАВЛЕНО"
+            les_txt.append(
+                f"- {kind}: {x.get('art')} {x.get('name') or ''} | {ai_line(row)}"
+                f" | период {per.get('days') or '?'} дн., запас {x.get('cover') or '?'} дн."
+                f" | закупщик решил: {x.get('manual')}"
+                + (f" | причина: {x.get('reason')}" if x.get("reason") else ""))
+        pos_txt = []
+        for r in rows:
+            pos_txt.append(f"i={r.get('i')}: {r.get('art') or ''}"
+                           + (f" (замена {r['repl']})" if r.get("repl") else "")
+                           + f" {r.get('name') or ''} | {ai_line(r)}")
+        prompt = (
+            "Ты помогаешь закупщику запчастей Porsche решить, сколько штук каждой "
+            "позиции заказать.\n\n"
+            "Базовая формула (поле «формула»): спрос в день = 0.6·(общие продажи "
+            "за период / дней периода) + 0.4·(продажи за 365 дн. / 365); "
+            "в заказ = спрос × дней запаса − наличие − заказано, округлить вверх, "
+            "не меньше 0.\n\n"
+            "Методичка — прошлые решения закупщика. ОДОБРЕНО — расчёт был признан "
+            "верным; ИСПРАВЛЕНО — закупщик поставил своё число и объяснил причину. "
+            "Выведи из них правила (по типам деталей, моделям, оборачиваемости, "
+            "наличию, причинам) и примени к новым позициям. Если ни одно правило "
+            "к позиции не подходит — оставь число формулы.\n\n"
+            "МЕТОДИЧКА:\n" + "\n".join(les_txt) + "\n\n"
+            f"ТЕКУЩАЯ ПАРТИЯ: период {d.get('period_days') or '?'} дн., "
+            f"запас {d.get('cover_days') or '?'} дн.\n"
+            "ПОЗИЦИИ:\n" + "\n".join(pos_txt) + "\n\n"
+            "Ответь ТОЛЬКО JSON-массивом, по одному объекту на каждую позицию: "
+            '[{"i": <номер i>, "q": <целое ≥ 0>, "why": "<коротко по-русски: '
+            'какое правило применил или «по формуле»>"}]')
+        try:
+            msg = client.messages.create(
+                model=model, max_tokens=8000,
+                messages=[{"role": "user", "content": prompt}])
+            if ctx.get("add_cost"):
+                ctx["add_cost"](msg)
+            txt = (ctx["extract_text"](msg) if ctx.get("extract_text")
+                   else "".join(getattr(b, "text", "") for b in msg.content))
+            m = re.search(r"\[.*\]", txt, re.S)
+            data = json.loads(m.group(0)) if m else []
+        except Exception as e:
+            return jsonify({"error": f"Ошибка ИИ: {e}"}), 500
+        want = {str(r.get("i")) for r in rows}
+        out = []
+        for x in data if isinstance(data, list) else []:
+            if not isinstance(x, dict) or str(x.get("i")) not in want:
+                continue
+            q = parse_num(x.get("q"))
+            if q is None or q < 0:
+                continue
+            out.append({"i": x.get("i"), "q": int(round(q)),
+                        "why": str(x.get("why") or "")[:500]})
+        return jsonify({"ok": True, "results": out, "lessons_used": len(lessons)})
 
     @app.post("/api/sales_lesson_del")
     def api_sales_lesson_del():
@@ -387,6 +478,7 @@ def register(ctx):
       <input id="slCover" class="slnum" type="number" min="1"></label>
     <input id="slSearch" placeholder="Поиск по артикулу или названию">
     <button onclick="slAddRow()">+ Строка</button>
+    <button id="slAiBtn" onclick="slAiRecalc()" title="Пересчитать «В заказ» для непроверенных строк по правилам, которые ИИ выводит из методички (одобрения ✓ и правки ✎). Платный запрос к ИИ.">🤖 Пересчитать по правилам ИИ</button>
     <button onclick="slResetOrder()" title="Снять фильтры и сортировку, выстроить строки по № от 1">↺ Вернуть исходный порядок</button>
     <button onclick="slExport()">⬇️ Скачать CSV</button>
     <button onclick="document.getElementById('slCatXls').click()"
@@ -434,7 +526,9 @@ def register(ctx):
     (по умолчанию 60 = 2 месяца) − наличие − уже заказано. Наведите на число, чтобы
     увидеть расчёт. Статус: «Требует проверки» — число посчитал ИИ; ✓ — количество верное,
     статус «Одобрено» (без комментария); ✎ или правка числа — спросим причину, статус
-    «Скорректировано». Одобрения и правки копятся в методичке для обучения ИИ.</p>
+    «Скорректировано». Одобрения и правки копятся в методичке; кнопка «🤖 Пересчитать
+    по правилам ИИ» пересчитывает непроверенные строки с учётом методички (такие числа
+    помечены 🤖, наведите — увидите причину; если цифры строки поменяются, вернётся формула).</p>
 """
 
     CSS = """
@@ -497,6 +591,9 @@ def register(ctx):
                   border:1px solid var(--line);border-radius:6px}
   #slTable tr.cur td{background-color:#eaf3ff}
   #slTable tr.cur td.order{background-color:#ffd4a8}
+  #slTable td.order{position:relative}
+  #slTable td.order.ai::before{content:'🤖';position:absolute;left:4px;top:50%;transform:translateY(-50%);
+        font-size:11px;pointer-events:none}
   #slTable td.order.good{background-color:#cdeed8}
   #slTable td.order.good input{color:#166534}
   #slTable tr.cur td.order.good{background-color:#b6e5c6}
@@ -585,7 +682,48 @@ function slOrder(r){
     +'\nНужно на '+C+' дн.: '+slFmt(need)
     +'\nЕсть: наличие '+(r.stock||0)+' + заказано '+(r.ordered||0)+' = '+have
     +'\nВ заказ: '+q;
-  return {q:q, why:why, any:(tot>0||yr>0||r.stock!=null||r.ordered!=null)};
+  var any=(tot>0||yr>0||r.stock!=null||r.ordered!=null);
+  if(r.order_ai!=null && r.order_ai_sig===slAiSig(r))   // ИИ считал по этим же данным
+    return {q:r.order_ai, any:true, ai:true, fq:q,
+      why:'🤖 ИИ по методичке: '+(r.order_ai_why||'')+'\n\nФормула дала бы '+q+':\n'+why};
+  return {q:q, why:why, any:any};
+}
+/* «отпечаток» данных строки: если поменялись цифры/период/запас — число ИИ устарело */
+function slAiSig(r){
+  return ['profit','turn_de','sold_de','sold_sup','sold_stock','stock','ordered','transit','year']
+    .map(function(k){ return r[k]==null?'':r[k]; })
+    .concat([slPeriodDays()||SL.settings.period_days||90, SL.settings.cover_days||60]).join('|');
+}
+async function slAiRecalc(){
+  var idx=[]; SL.rows.forEach(function(r,i){
+    if(r.art && r.order_manual==null && slStatus(r)==='Требует проверки') idx.push(i); });   // пустые строки без цифр не трогаем
+  if(!idx.length){ alert('Нет непроверенных строк — все одобрены или исправлены.'); return; }
+  if(!SL.lessons){ alert('Методичка пуста. Сначала одобрите ✓ или исправьте ✎ несколько строк — из них ИИ выведет правила.'); return; }
+  if(!confirm('Пересчитать «В заказ» для '+idx.length+' непроверенных строк по правилам из методички ('
+    +SL.lessons+' зап.)?\nОдобренные и скорректированные строки не трогаются. Это платный запрос к ИИ.')) return;
+  var btn=document.getElementById('slAiBtn'), msg=document.getElementById('slSaved'), done=0, changed=0;
+  btn.disabled=true;
+  try{
+    for(var k=0;k<idx.length;k+=40){
+      var part=idx.slice(k,k+40);
+      msg.textContent='🤖 ИИ считает: '+done+' из '+idx.length+'…';
+      var rows=part.map(function(i){ var r=SL.rows[i], o=slOrder(r);
+        return {i:i, art:r.art, repl:r.repl, name:slName(r), profit:r.profit, turn_de:r.turn_de,
+          sold_de:r.sold_de, sold_sup:r.sold_sup, sold_stock:r.sold_stock, total:slTotal(r),
+          stock:r.stock, ordered:r.ordered, transit:r.transit, year:r.year, calc:o.ai?o.fq:o.q}; });
+      var res=await api('/api/sales_ai',{rows:rows, period_days:slPeriodDays()||SL.settings.period_days||90,
+        cover_days:SL.settings.cover_days||60});
+      if(!res || res.error){ alert(res&&res.error||'Ошибка ИИ'); break; }
+      (res.results||[]).forEach(function(x){ var i=+x.i, r=SL.rows[i]; if(!r) return;
+        var before=slOrderVal(r);
+        r.order_ai=x.q; r.order_ai_why=x.why; r.order_ai_sig=slAiSig(r);
+        if(slOrderVal(r)!==before) changed++;
+        slRefreshRow(i, true); });
+      done+=part.length;
+    }
+  } finally { btn.disabled=false; }
+  slStCount(); slSave();
+  setTimeout(function(){ msg.textContent='🤖 Пересчитано строк: '+done+', изменилось: '+changed; }, 1200);
 }
 function slOrderVal(r){
   if(r.order_manual!=null) return r.order_manual;
@@ -648,6 +786,7 @@ async function slLoad(){
   }catch(e){ document.getElementById('slSaved').textContent='Не удалось загрузить таблицу.'; }
 }
 function slLessonsCount(n){
+  SL.lessons=n||0;
   var w=(n%10===1&&n%100!==11)?'запись':((n%10>=2&&n%10<=4&&(n%100<10||n%100>=20))?'записи':'записей');
   document.getElementById('slLessons').textContent=n?('📘 Методичка: '+n+' '+w):''; }
 function slCatCount(n){ document.getElementById('slCatCnt').textContent=n?'('+n+')':''; }
@@ -798,7 +937,7 @@ function slCellHtml(r,i,c,ci){
     var o=slOrder(r), man=r.order_manual!=null;
     var tip=man?('Исправлено вручную. Расчёт: '+(o.any?o.q:'—')+'\nОчистите ячейку, чтобы вернуть расчёт.\n\n'+o.why):o.why;
     var good=man||slStatus(r)==='Одобрено';   // проверено человеком — зелёным
-    return '<td class="order'+(man?' manual':'')+(good?' good':'')+'" title="'+slEsc(tip)+'"><input data-i="'+i+'" data-c="'+ci
+    return '<td class="order'+(man?' manual':'')+(good?' good':'')+(!man&&o.ai?' ai':'')+'" title="'+slEsc(tip)+'"><input data-i="'+i+'" data-c="'+ci
       +'" value="'+slEsc(slFmt(slOrderVal(r)))+'"></td>';
   }
   var v=r[c.k]; v=(c.ty==='num')?slFmt(v):(v||'');
@@ -947,7 +1086,7 @@ async function slApprove(i){
   clearTimeout(SL.saveTimer); SL.saveTimer=null; await slSaveNow();   // нужен id слепка
   try{
     var p=SL.period; var res=await api('/api/sales_lesson',{snap:SL.id, art:r.art, repl:r.repl, name:slName(r),
-      approved:true, calc:o.q, manual:o.q, reason:'', cover:SL.settings.cover_days,
+      approved:true, ai:!!o.ai, calc:o.q, manual:o.q, reason:o.ai?('ИИ: '+(r.order_ai_why||'')):'', cover:SL.settings.cover_days,
       period:{from:p.from||'', to:p.to||'', days:slPeriodDays()}, row:slLessonRow(r)});
     if(res.ok) slLessonsCount(res.lessons_count);
   }catch(e){}
@@ -968,7 +1107,7 @@ async function slDlgOk(){
   try{
     var row=slLessonRow(r);
     var p=SL.period; var res=await api('/api/sales_lesson',{snap:SL.id, art:r.art, repl:r.repl, name:slName(r),
-      calc:o.any?o.q:null, manual:qty, reason:reason, cover:SL.settings.cover_days,
+      ai:!!o.ai, calc:o.any?o.q:null, manual:qty, reason:reason, cover:SL.settings.cover_days,
       period:{from:p.from||'', to:p.to||'', days:slPeriodDays()}, row:row});
     if(res.ok) slLessonsCount(res.lessons_count);
   }catch(e){}
