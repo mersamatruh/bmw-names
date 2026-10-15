@@ -478,7 +478,6 @@ def register(ctx):
       <input id="slCover" class="slnum" type="number" min="1"></label>
     <input id="slSearch" placeholder="Поиск по артикулу или названию">
     <button onclick="slAddRow()">+ Строка</button>
-    <button id="slAiBtn" onclick="slAiRecalc()" title="Пересчитать «В заказ» для непроверенных строк по правилам, которые ИИ выводит из методички (одобрения ✓ и правки ✎). Платный запрос к ИИ.">🤖 Пересчитать по правилам ИИ</button>
     <button onclick="slResetOrder()" title="Снять фильтры и сортировку, выстроить строки по № от 1">↺ Вернуть исходный порядок</button>
     <button onclick="slExport()">⬇️ Скачать CSV</button>
     <button onclick="document.getElementById('slCatXls').click()"
@@ -526,9 +525,9 @@ def register(ctx):
     (по умолчанию 60 = 2 месяца) − наличие − уже заказано. Наведите на число, чтобы
     увидеть расчёт. Статус: «Требует проверки» — число посчитал ИИ; ✓ — количество верное,
     статус «Одобрено» (без комментария); ✎ или правка числа — спросим причину, статус
-    «Скорректировано». Одобрения и правки копятся в методичке; кнопка «🤖 Пересчитать
-    по правилам ИИ» пересчитывает непроверенные строки с учётом методички (такие числа
-    помечены 🤖, наведите — увидите причину; если цифры строки поменяются, вернётся формула).</p>
+    «Скорректировано». Одобрения и правки копятся в методичке; маленькая кнопка ↻ в ячейке
+    «В заказ» пересчитывает ИИ именно эту строку по правилам методички (такое число помечено
+    🤖, наведите — увидите причину; если цифры строки поменяются, вернётся формула).</p>
 """
 
     CSS = """
@@ -592,8 +591,12 @@ def register(ctx):
   #slTable tr.cur td{background-color:#eaf3ff}
   #slTable tr.cur td.order{background-color:#ffd4a8}
   #slTable td.order{position:relative}
-  #slTable td.order.ai::before{content:'🤖';position:absolute;left:4px;top:50%;transform:translateY(-50%);
-        font-size:11px;pointer-events:none}
+  #slTable td.order button.aib{position:absolute;left:3px;top:50%;transform:translateY(-50%);z-index:1;
+        border:1px solid transparent;background:none;border-radius:4px;padding:0 3px;font-size:12px;
+        line-height:18px;cursor:pointer;color:#b0682a;opacity:.55}
+  #slTable td.order:hover button.aib,#slTable td.order button.aib.on{opacity:1}
+  #slTable td.order button.aib:hover{border-color:#e0a46c;background:#fff6ec}
+  #slTable td.order input{padding-left:24px}
   #slTable td.order.good{background-color:#cdeed8}
   #slTable td.order.good input{color:#166534}
   #slTable tr.cur td.order.good{background-color:#b6e5c6}
@@ -694,36 +697,28 @@ function slAiSig(r){
     .map(function(k){ return r[k]==null?'':r[k]; })
     .concat([slPeriodDays()||SL.settings.period_days||90, SL.settings.cover_days||60]).join('|');
 }
-async function slAiRecalc(){
-  var idx=[]; SL.rows.forEach(function(r,i){
-    if(r.art && r.order_manual==null && slStatus(r)==='Требует проверки') idx.push(i); });   // пустые строки без цифр не трогаем
-  if(!idx.length){ alert('Нет непроверенных строк — все одобрены или исправлены.'); return; }
+/* кнопка ↻ в ячейке «В заказ»: пересчитать ИИ по методичке только эту строку */
+async function slAiOne(i, btn){
+  var r=SL.rows[i]; if(!r) return;
+  if(!r.art){ alert('Сначала укажите артикул в этой строке.'); return; }
   if(!SL.lessons){ alert('Методичка пуста. Сначала одобрите ✓ или исправьте ✎ несколько строк — из них ИИ выведет правила.'); return; }
-  if(!confirm('Пересчитать «В заказ» для '+idx.length+' непроверенных строк по правилам из методички ('
-    +SL.lessons+' зап.)?\nОдобренные и скорректированные строки не трогаются. Это платный запрос к ИИ.')) return;
-  var btn=document.getElementById('slAiBtn'), msg=document.getElementById('slSaved'), done=0, changed=0;
-  btn.disabled=true;
+  var o=slOrder(r), msg=document.getElementById('slSaved');
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  msg.textContent='🤖 ИИ считает '+r.art+'…';
   try{
-    for(var k=0;k<idx.length;k+=40){
-      var part=idx.slice(k,k+40);
-      msg.textContent='🤖 ИИ считает: '+done+' из '+idx.length+'…';
-      var rows=part.map(function(i){ var r=SL.rows[i], o=slOrder(r);
-        return {i:i, art:r.art, repl:r.repl, name:slName(r), profit:r.profit, turn_de:r.turn_de,
-          sold_de:r.sold_de, sold_sup:r.sold_sup, sold_stock:r.sold_stock, total:slTotal(r),
-          stock:r.stock, ordered:r.ordered, transit:r.transit, year:r.year, calc:o.ai?o.fq:o.q}; });
-      var res=await api('/api/sales_ai',{rows:rows, period_days:slPeriodDays()||SL.settings.period_days||90,
-        cover_days:SL.settings.cover_days||60});
-      if(!res || res.error){ alert(res&&res.error||'Ошибка ИИ'); break; }
-      (res.results||[]).forEach(function(x){ var i=+x.i, r=SL.rows[i]; if(!r) return;
-        var before=slOrderVal(r);
-        r.order_ai=x.q; r.order_ai_why=x.why; r.order_ai_sig=slAiSig(r);
-        if(slOrderVal(r)!==before) changed++;
-        slRefreshRow(i, true); });
-      done+=part.length;
-    }
-  } finally { btn.disabled=false; }
-  slStCount(); slSave();
-  setTimeout(function(){ msg.textContent='🤖 Пересчитано строк: '+done+', изменилось: '+changed; }, 1200);
+    var res=await api('/api/sales_ai',{rows:[{i:i, art:r.art, repl:r.repl, name:slName(r), profit:r.profit,
+        turn_de:r.turn_de, sold_de:r.sold_de, sold_sup:r.sold_sup, sold_stock:r.sold_stock, total:slTotal(r),
+        stock:r.stock, ordered:r.ordered, transit:r.transit, year:r.year, calc:o.ai?o.fq:o.q}],
+      period_days:slPeriodDays()||SL.settings.period_days||90, cover_days:SL.settings.cover_days||60});
+    var x=res&&res.results&&res.results[0];
+    if(!res || res.error || !x){ msg.textContent=''; alert(res&&res.error||'ИИ не вернул ответ — попробуйте ещё раз.'); return; }
+    var before=slOrderVal(r);
+    r.order_ai=x.q; r.order_ai_why=x.why; r.order_ai_sig=slAiSig(r);
+    var note='🤖 '+r.art+': '+(before===x.q?'без изменений ('+x.q+')':(before==null?'':before)+' → '+x.q);
+    msg.textContent=note; slSave();
+    setTimeout(function(){ msg.textContent=note; }, 1300);   // не затирать «Сохранено»
+  } catch(e){ msg.textContent=''; alert('Ошибка ИИ: '+e); }
+  finally { slRefreshRow(i); }
 }
 function slOrderVal(r){
   if(r.order_manual!=null) return r.order_manual;
@@ -937,7 +932,9 @@ function slCellHtml(r,i,c,ci){
     var o=slOrder(r), man=r.order_manual!=null;
     var tip=man?('Исправлено вручную. Расчёт: '+(o.any?o.q:'—')+'\nОчистите ячейку, чтобы вернуть расчёт.\n\n'+o.why):o.why;
     var good=man||slStatus(r)==='Одобрено';   // проверено человеком — зелёным
-    return '<td class="order'+(man?' manual':'')+(good?' good':'')+(!man&&o.ai?' ai':'')+'" title="'+slEsc(tip)+'"><input data-i="'+i+'" data-c="'+ci
+    var aiBtn=(!man && o.any && r.art)?'<button class="aib'+(o.ai?' on':'')+'" onmousedown="event.stopPropagation()" onclick="slAiOne('+i+',this)" title="'
+      +(o.ai?'Число посчитал ИИ по методичке. Нажмите, чтобы пересчитать заново':'Обновить: пересчитать эту строку ИИ по правилам методички')+'">'+(o.ai?'🤖':'↻')+'</button>':'';
+    return '<td class="order'+(man?' manual':'')+(good?' good':'')+'" title="'+slEsc(tip)+'">'+aiBtn+'<input data-i="'+i+'" data-c="'+ci
       +'" value="'+slEsc(slFmt(slOrderVal(r)))+'"></td>';
   }
   var v=r[c.k]; v=(c.ty==='num')?slFmt(v):(v||'');
