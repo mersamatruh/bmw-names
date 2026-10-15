@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "4.72 от 15.10.2026"
+VERSION = "4.73 от 15.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -1577,6 +1577,9 @@ def _load_modules():
     ctx = {
         "app": app, "check_auth": check_auth, "lock": lock,
         "jsonify": jsonify, "request": request, "data_dir": HERE,
+        # доступ к ИИ для модулей: тот же клиент, модель и учёт расхода
+        "client": client, "model": gn.MODEL, "add_cost": add_cost,
+        "extract_text": gn.extract_text,
     }
     for path in sorted(glob.glob(os.path.join(HERE, "mod_*.py"))):
         name = os.path.splitext(os.path.basename(path))[0]
