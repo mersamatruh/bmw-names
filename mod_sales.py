@@ -26,7 +26,8 @@ import datetime
 # Колонки, которые хранятся в строке (наименование, «общие продажи»
 # и «в заказ» вычисляются и не хранятся).
 TEXT_FIELDS = ("art", "repl", "comment", "order_reason",
-               "order_ai_why", "order_ai_sig")  # пояснение ИИ и «отпечаток» данных строки
+               "order_ai_why", "order_ai_sig",  # пояснение ИИ и «отпечаток» данных строки
+               "name_ai", "name_ai_why")        # русское название, найденное ИИ (ещё не в справочнике)
 NUM_FIELDS = ("profit", "turn_de", "sold_de", "sold_sup", "sold_stock",
               "stock", "ordered", "transit", "year",
               "order_manual",  # «в заказ», исправленное вручную
@@ -337,6 +338,79 @@ def register(ctx):
                         "why": str(x.get("why") or "")[:500]})
         return jsonify({"ok": True, "results": out, "lessons_used": len(lessons)})
 
+    # ---------- Поиск русского названия детали (ИИ + поиск в интернете) ----------
+
+    @app.post("/api/sales_name_ai")
+    def api_sales_name_ai():
+        """Позиции без названия или с нерусским названием → русское название.
+        Не больше 5 за раз: на каждую ИИ может поискать в интернете."""
+        if not check_auth(request):
+            return deny()
+        client, model = ctx.get("client"), ctx.get("model")
+        if client is None or not model:
+            return jsonify({"error": "ИИ недоступен на сервере"}), 500
+        d = request.get_json(force=True) or {}
+        rows = [r for r in (d.get("rows") or []) if norm_art(r.get("art"))][:5]
+        if not rows:
+            return jsonify({"error": "Нет позиций"}), 400
+        cat = load_json(CATALOG_PATH, {})
+        # образцы стиля — русские названия, которые уже есть в справочнике
+        samples = [f"{a} — {n}" for a, n in cat.items() if re.search(r"[А-Яа-яЁё]", n or "")][-40:]
+        pos = []
+        for r in rows:
+            pos.append(f"i={r.get('i')}: артикул {norm_art(r.get('art'))}"
+                       + (f", замена {norm_art(r['repl'])}" if r.get("repl") else "")
+                       + (f", текущее название: «{str(r['name'])[:200]}»" if r.get("name") else ""))
+        prompt = (
+            "Ты помогаешь закупщику запчастей Porsche. Для каждой позиции найди, что "
+            "это за деталь, и дай короткое русское название, как в каталоге запчастей.\n"
+            "Если текущее название есть (на английском или немецком) — переведи его "
+            "по смыслу на русский. Если названия нет — найди деталь по артикулу "
+            "(оригинальный номер Porsche) в интернете. Название — по-русски, кратко, "
+            "с большой буквы; модель автомобиля добавь в скобках, только если она "
+            "точно известна. Не выдумывай: если деталь не удалось определить, "
+            "верни пустое название.\n\n"
+            + ("ОБРАЗЦЫ НАЗВАНИЙ ИЗ НАШЕГО СПРАВОЧНИКА (держись этого стиля):\n"
+               + "\n".join(samples) + "\n\n" if samples else "")
+            + "ПОЗИЦИИ:\n" + "\n".join(pos) + "\n\n"
+            "В конце ответь JSON-массивом, по одному объекту на позицию: "
+            '[{"i": <номер i>, "name": "<русское название или пусто>", '
+            '"why": "<коротко по-русски: откуда взято>"}]')
+        try:
+            msg = client.messages.create(
+                model=model, max_tokens=3000,
+                messages=[{"role": "user", "content": prompt}],
+                tools=[{"type": "web_search_20250305", "name": "web_search",
+                        "max_uses": 2 * len(rows) + 1}])
+            if ctx.get("add_cost"):
+                ctx["add_cost"](msg)
+            txt = (ctx["extract_text"](msg) if ctx.get("extract_text")
+                   else "".join(getattr(b, "text", "") for b in msg.content))
+            m = re.search(r"\[\s*\{.*\}\s*\]", txt, re.S)
+            data = json.loads(m.group(0)) if m else []
+        except Exception as e:
+            return jsonify({"error": f"Ошибка ИИ: {e}"}), 500
+        want = {str(r.get("i")) for r in rows}
+        out = []
+        for x in data if isinstance(data, list) else []:
+            if isinstance(x, dict) and str(x.get("i")) in want:
+                out.append({"i": x.get("i"), "name": str(x.get("name") or "").strip()[:300],
+                            "why": str(x.get("why") or "")[:500]})
+        return jsonify({"ok": True, "results": out})
+
+    @app.post("/api/sales_name_ok")
+    def api_sales_name_ok():
+        """Галочка «подтвердить»: найденное название уходит в справочник."""
+        if not check_auth(request):
+            return deny()
+        d = request.get_json(force=True) or {}
+        art, name = norm_art(d.get("art")), str(d.get("name") or "").strip()
+        if not art or not name:
+            return jsonify({"error": "Нужны артикул и название"}), 400
+        res = catalog_merge([(art, name)])
+        res["art"], res["name"] = art, name
+        return jsonify(res)
+
     @app.post("/api/sales_lesson_del")
     def api_sales_lesson_del():
         """Правку отменили (вернули расчёт) — убрать её из методички."""
@@ -479,6 +553,7 @@ def register(ctx):
     <input id="slSearch" placeholder="Поиск по артикулу или названию">
     <button onclick="slAddRow()">+ Строка</button>
     <button id="slAiAll" onclick="slAiRecalc()" title="Пересчитать ИИ по правилам методички все строки со статусом «Требует проверки». Одобренные и скорректированные не трогаются. Платный запрос к ИИ.">🤖 Пересчитать все</button>
+    <button id="slNmAll" onclick="slNameAll()" title="Найти русские названия для всех строк, где названия нет или оно не на русском. ИИ ищет деталь в интернете. Платный запрос.">🔍 Русские названия</button>
     <button onclick="slResetOrder()" title="Снять фильтры и сортировку, выстроить строки по № от 1">↺ Вернуть исходный порядок</button>
     <button id="slColReset" onclick="slColReset()" title="Вернуть столбцы на их обычные места" style="display:none">⇆ Столбцы по умолчанию</button>
     <button onclick="slExport()">⬇️ Скачать CSV</button>
@@ -608,6 +683,17 @@ def register(ctx):
   #slTable td.sel{background:#d6e5fc !important;border-color:#d6e5fc}   /* внутри блока — без сетки, рамка только снаружи */
   #slTable td.sel input{background:transparent}
   #slTable td.nm.miss{color:var(--mut);font-style:italic}
+  #slTable td.nm .nm0.miss{color:var(--mut);font-style:italic}
+  #slTable td.nm.ai{min-width:330px}
+  #slTable td.nm.ai .nm0{display:block;color:var(--mut);font-size:11px}
+  #slTable td.nm .nmno{color:#b45309;font-size:11px;font-style:normal}
+  #slTable td.nm .nmb{margin-left:6px;padding:1px 6px;font-size:11px;line-height:1.4;border-radius:5px;font-style:normal}
+  #slTable td.nm .nmrow{display:flex;align-items:center;gap:6px;margin-top:2px}
+  #slTable td.nm input.nmai{flex:1;min-width:120px;padding:3px 6px;font:12px/1.3 inherit;border:1px solid #c4b5fd;
+        background:#f5f3ff;border-radius:4px}
+  #slTable td.nm .nmok{white-space:nowrap;font-size:11px;font-style:normal;color:var(--text);cursor:pointer;
+        display:flex;align-items:center;gap:3px}
+  #slTable td.nm .nmb{margin-left:0}
   #slTable td.del{width:28px;text-align:center}
   #slTable td.del button{border:none;background:none;color:var(--mut);padding:4px}
   #slTable td.del button:hover{color:var(--err)}
@@ -764,6 +850,65 @@ function slOrderVal(r){
 function slName(r){
   return SL.names[r.art] || (r.repl && SL.names[r.repl]) || '';
 }
+/* ---------- русское название: поиск ИИ и подтверждение в справочник ---------- */
+function slIsRu(n){ return /[А-Яа-яЁё]/.test(n||''); }
+function slNeedRu(r){ return !!r.art && !slIsRu(slName(r)); }
+async function slNameAsk(idx){
+  var res=await api('/api/sales_name_ai',{rows:idx.map(function(i){ var r=SL.rows[i];
+    return {i:i, art:r.art, repl:r.repl, name:slName(r)}; })});
+  if(!res || res.error) throw new Error(res&&res.error||'ИИ не ответил');
+  var found=0;
+  (res.results||[]).forEach(function(x){ var r=SL.rows[+x.i]; if(!r) return;
+    r.name_ai=x.name||''; r.name_ai_why=x.why||(x.name?'':'не удалось определить'); if(x.name) found++; slRefreshRow(+x.i, true); });
+  return found;
+}
+async function slNameOne(i, btn){
+  var r=SL.rows[i]; if(!r||!r.art) return;
+  var msg=document.getElementById('slSaved');
+  if(btn){ btn.disabled=true; btn.textContent='…'; }
+  msg.textContent='🔍 ИИ ищет название '+r.art+'…';
+  try{ var f=await slNameAsk([i]); slSave();
+    var note='🔍 '+r.art+': '+(f?'найдено «'+r.name_ai+'» — проверьте и поставьте «подтвердить»':'ИИ не смог определить деталь');
+    msg.textContent=note; setTimeout(function(){ msg.textContent=note; }, 1300); }
+  catch(e){ msg.textContent=''; alert('Ошибка: '+e.message); }
+  finally { slRefreshRow(i); }
+}
+async function slNameAll(){
+  var idx=[]; SL.rows.forEach(function(r,i){ if(slNeedRu(r) && !r.name_ai && !r.name_ai_why) idx.push(i); });   // где ИИ уже не нашёл — только кнопкой 🔍 в строке
+  if(!idx.length){ alert('Нет строк, где нужно искать: у всех есть русское название или уже найденное (подтвердите его). Где ИИ не нашёл — нажмите 🔍 в строке.'); return; }
+  if(!confirm('Найти русские названия для '+idx.length+' строк?\nИИ ищет детали в интернете — это платные запросы.')) return;
+  var btn=document.getElementById('slNmAll'), msg=document.getElementById('slSaved'), done=0, found=0;
+  btn.disabled=true;
+  try{
+    for(var k=0;k<idx.length;k+=5){
+      msg.textContent='🔍 ИИ ищет названия: '+done+' из '+idx.length+'…';
+      try{ found+=await slNameAsk(idx.slice(k,k+5)); }
+      catch(e){ alert('Ошибка: '+e.message); break; }
+      done+=Math.min(5, idx.length-k); slSave();
+    }
+  } finally { btn.disabled=false; }
+  setTimeout(function(){ msg.textContent='🔍 Обработано строк: '+done+', найдено названий: '+found+'. Проверьте и поставьте «подтвердить».'; }, 1300);
+}
+async function slNameOk(i, cb){
+  var r=SL.rows[i], inp=cb.closest('td').querySelector('input.nmai');
+  var name=(inp?inp.value:r.name_ai||'').trim();
+  if(!name){ cb.checked=false; alert('Название пустое.'); return; }
+  cb.disabled=true;
+  var res=await api('/api/sales_name_ok',{art:r.art, name:name});
+  if(!res || res.error){ cb.checked=false; cb.disabled=false; alert(res&&res.error||'Не удалось записать в справочник'); return; }
+  SL.names[res.art]=res.name; delete r.name_ai; delete r.name_ai_why;
+  slCatCount(res.catalog_size);
+  // у других строк с тем же артикулом подсказка тоже больше не нужна
+  SL.rows.forEach(function(x,j){ if(x!==r && x.art===r.art && x.name_ai!=null){ delete x.name_ai; delete x.name_ai_why; } });
+  SL.rows.forEach(function(x,j){ if(x.art===r.art||x.repl===r.art) slRefreshRow(j, true); });
+  slSave();
+  var msg=document.getElementById('slSaved'), note='📚 В справочник: '+res.art+' — '+res.name;
+  msg.textContent=note; setTimeout(function(){ msg.textContent=note; }, 1300);
+}
+document.addEventListener('change', function(e){
+  var el=e.target; if(!el.classList || !el.classList.contains('nmai')) return;
+  var r=SL.rows[+el.dataset.nm]; if(r){ r.name_ai=el.value.trim(); slSave(); }
+});
 
 function slSnapList(list){
   var s=document.getElementById('slSnaps');
@@ -1015,8 +1160,16 @@ function slCellHtml(r,i,c,ci){
   if(c.ty==='nid') return '<td class="nid">'+(r.n||'')+'</td>';
   if(c.ty==='name'){
     var n=slName(r);
-    if(n) return '<td class="nm">'+slEsc(n)+'</td>';
-    return '<td class="nm miss">'+(r.art?'нет в справочнике':'')+'</td>';
+    if(!r.art) return '<td class="nm"></td>';
+    if(slIsRu(n)) return '<td class="nm">'+slEsc(n)+'</td>';
+    var cur=n?'<span class="nm0">'+slEsc(n)+'</span>':'<span class="nm0 miss">нет в справочнике</span>';
+    if(!r.name_ai)   // ещё не искали, или ИИ не нашёл (тогда есть пояснение)
+      return '<td class="nm'+(n?'':' miss')+'">'+cur+(r.name_ai_why?' <span class="nmno" title="'+slEsc(r.name_ai_why||'')+'">ИИ не нашёл</span>':'')
+        +'<button class="nmb" onclick="slNameOne('+i+',this)" title="Найти русское название (ИИ ищет деталь в интернете)">🔍</button></td>';
+    return '<td class="nm ai">'+cur+'<div class="nmrow"><input class="nmai" data-nm="'+i+'" value="'+slEsc(r.name_ai)
+      +'" title="Найдено ИИ: '+slEsc(r.name_ai_why||'')+'\nМожно поправить перед подтверждением">'
+      +'<label class="nmok" title="Название верное — записать в справочник"><input type="checkbox" onchange="slNameOk('+i+',this)"> подтвердить</label>'
+      +'<button class="nmb" onclick="slNameOne('+i+',this)" title="Искать заново">↻</button></div></td>';
   }
   if(c.k==='total') return '<td class="calc">'+slFmt(slTotal(r))+'</td>';
   if(c.ty==='status'){
