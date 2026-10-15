@@ -215,7 +215,7 @@ def register(ctx):
     SECTION_HTML = """
   <h2 style="margin:0 0 4px">📈 Анализ продаж</h2>
   <p class="hint" style="margin:0 0 14px">Анализатор продаж Porsche (пробная версия).
-    Вносите позиции или вставляйте блок из Excel (Ctrl+V в любую ячейку). Всё
+    Вносите позиции или вставляйте столбцы из Excel вместе с заголовком (Ctrl+V в ячейку первой строки) — заголовок отбросится. Всё
     сохраняется на сервере автоматически.</p>
   <div class="bar">
     <label class="hint">Период продаж, дней
@@ -230,6 +230,8 @@ def register(ctx):
     <input type="file" id="slCatXls" accept=".xlsx,.xls,.xlsm,.csv,.txt,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" style="display:none"
            onchange="slCatUpload(this)">
     <button onclick="slToggleCat()">📚 Справочник <span id="slCatCnt" class="hint"></span></button>
+    <label class="hint" title="При вставке из Excel первая строка (название столбца) отбрасывается">
+      <input type="checkbox" id="slSkipHead" checked> Убирать заголовок при вставке</label>
     <span id="slSaved" class="hint"></span>
   </div>
   <div id="slCat" class="panel" style="display:none;padding:12px 14px;margin-bottom:12px">
@@ -460,6 +462,8 @@ document.addEventListener('paste', async function(e){
   e.preventDefault();
   var lines=txt.replace(/\r/g,'').split('\n');
   if(lines.length && lines[lines.length-1]==='') lines.pop();
+  var head='', sk=document.getElementById('slSkipHead');
+  if(sk && sk.checked && lines.length>1){ head=lines.shift().replace(/\t/g,' | ').trim(); }
   var i0=+el.dataset.i, c0=+el.dataset.c, arts=[];
   lines.forEach(function(line,li){
     var i=i0+li; while(SL.rows.length<=i) SL.rows.push({});
@@ -468,7 +472,14 @@ document.addEventListener('paste', async function(e){
   });
   await slLookup(arts);
   slRender(); slSave();
+  if(head) setTimeout(function(){
+    document.getElementById('slSaved').textContent='Вставлено строк: '+lines.length
+      +' · убран заголовок «'+head+'»'; }, 1500);
 });
+(function(){ var sk=document.getElementById('slSkipHead'); if(!sk) return;
+  try{ if(localStorage.getItem('slSkipHead')==='0') sk.checked=false; }catch(e){}
+  sk.addEventListener('change', function(){
+    try{ localStorage.setItem('slSkipHead', sk.checked?'1':'0'); }catch(e){} }); })();
 /* стрелки вверх/вниз и Enter — по строкам */
 document.addEventListener('keydown', function(e){
   var el=e.target; if(!el.closest||!el.closest('#slTable')||el.dataset.c==null) return;
