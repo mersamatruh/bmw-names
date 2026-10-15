@@ -227,7 +227,7 @@ def register(ctx):
     <button onclick="slExport()">⬇️ Скачать CSV</button>
     <button onclick="document.getElementById('slCatXls').click()"
             title="Excel-файл: столбец A — артикул, столбец B — наименование">📥 Загрузить справочник (Excel)</button>
-    <input type="file" id="slCatXls" accept=".xlsx,.xls,.csv" style="display:none"
+    <input type="file" id="slCatXls" accept=".xlsx,.xls,.xlsm,.csv,.txt,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" style="display:none"
            onchange="slCatUpload(this)">
     <button onclick="slToggleCat()">📚 Справочник <span id="slCatCnt" class="hint"></span></button>
     <span id="slSaved" class="hint"></span>
@@ -235,11 +235,12 @@ def register(ctx):
   <div id="slCat" class="panel" style="display:none;padding:12px 14px;margin-bottom:12px">
     <div class="hint" style="margin-bottom:6px">Справочник «артикул → наименование».
       Скопируйте из Excel два столбца (артикул и наименование) и вставьте сюда,
-      либо выберите файл CSV/TXT. Существующие артикулы обновятся.</div>
+      либо загрузите файл Excel (столбец A — артикул, B — наименование).
+      Существующие артикулы обновятся.</div>
     <textarea id="slCatText" rows="6" placeholder="99610610155	Фильтр масляный"></textarea>
     <div class="bar" style="margin:8px 0 0">
       <button class="primary" onclick="slCatAdd()">Добавить в справочник</button>
-      <input type="file" id="slCatFile" accept=".csv,.txt,.tsv" onchange="slCatFile(this)">
+      <button onclick="document.getElementById('slCatXls').click()">📥 Загрузить файл Excel</button>
       <span id="slCatMsg" class="hint"></span>
     </div>
   </div>
@@ -519,12 +520,6 @@ async function slCatUpload(inp){
     SL.names={}; await slLookup([].concat.apply([],SL.rows.map(function(r){return [r.art,r.repl];})));
     slRender();
   }catch(e){ st.textContent='⚠️ Не удалось загрузить справочник'; }
-}
-function slCatFile(inp){
-  var f=inp.files&&inp.files[0]; if(!f) return;
-  var rd=new FileReader();
-  rd.onload=function(){ document.getElementById('slCatText').value=rd.result; inp.value=''; };
-  rd.readAsText(f,'utf-8');
 }
 function slExport(){
   var rows=[SL_COLS.map(function(c){return c.t;})];
