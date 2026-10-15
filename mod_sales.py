@@ -525,8 +525,8 @@ def register(ctx):
     (по умолчанию 60 = 2 месяца) − наличие − уже заказано. Наведите на число, чтобы
     увидеть расчёт. Статус: «Требует проверки» — число посчитал ИИ; ✓ — количество верное,
     статус «Одобрено» (без комментария); ✎ или правка числа — спросим причину, статус
-    «Скорректировано». Одобрения и правки копятся в методичке; маленькая кнопка ↻ в ячейке
-    «В заказ» пересчитывает ИИ именно эту строку по правилам методички (такое число помечено
+    «Скорректировано». Одобрения и правки копятся в методичке; кнопка ↻ в колонке «Статус»
+    (справа от ✎) пересчитывает ИИ именно эту строку по правилам методички (такое число помечено
     🤖, наведите — увидите причину; если цифры строки поменяются, вернётся формула).</p>
 """
 
@@ -591,12 +591,10 @@ def register(ctx):
   #slTable tr.cur td{background-color:#eaf3ff}
   #slTable tr.cur td.order{background-color:#ffd4a8}
   #slTable td.order{position:relative}
-  #slTable td.order button.aib{position:absolute;left:3px;top:50%;transform:translateY(-50%);z-index:1;
-        border:1px solid transparent;background:none;border-radius:4px;padding:0 3px;font-size:12px;
-        line-height:18px;cursor:pointer;color:#b0682a;opacity:.55}
-  #slTable td.order:hover button.aib,#slTable td.order button.aib.on{opacity:1}
-  #slTable td.order button.aib:hover{border-color:#e0a46c;background:#fff6ec}
-  #slTable td.order input{padding-left:24px}
+  #slTable td.order.ai::before{content:'🤖';position:absolute;left:4px;top:50%;transform:translateY(-50%);
+        font-size:11px;pointer-events:none}
+  #slTable td.st button.aib{color:#b0682a}
+  #slTable td.st button.aib.on{background:#fff3e4;border-color:#e0a46c}
   #slTable td.order.good{background-color:#cdeed8}
   #slTable td.order.good input{color:#166534}
   #slTable tr.cur td.order.good{background-color:#b6e5c6}
@@ -926,15 +924,16 @@ function slCellHtml(r,i,c,ci){
       +'<button class="stb'+(st==='Одобрено'?' on':'')+'" onclick="slApprove('+i+')" title="'
       +(st==='Одобрено'?'Снять одобрение':st==='Скорректировано'?'Отменить правку и одобрить расчёт ИИ':'Количество верное — одобрить')+'">✓</button>'
       +'<button class="stb'+(st==='Скорректировано'?' on':'')+'" onclick="slEditReason('+i+')" title="'
-      +(st==='Скорректировано'?'Изменить количество / причину':'Исправить количество с причиной')+'">✎</button></td>';
+      +(st==='Скорректировано'?'Изменить количество / причину':'Исправить количество с причиной')+'">✎</button>'
+      +(st!=='Скорректировано'&&r.art?'<button class="stb aib'+(slOrder(r).ai?' on':'')+'" onclick="slAiOne('+i+',this)" title="'
+        +(slOrder(r).ai?'Число посчитал ИИ по методичке. Нажмите, чтобы пересчитать заново':'Обновить: пересчитать эту строку ИИ по правилам методички')
+        +'">↻</button>':'')+'</td>';
   }
   if(c.k==='order'){
     var o=slOrder(r), man=r.order_manual!=null;
     var tip=man?('Исправлено вручную. Расчёт: '+(o.any?o.q:'—')+'\nОчистите ячейку, чтобы вернуть расчёт.\n\n'+o.why):o.why;
     var good=man||slStatus(r)==='Одобрено';   // проверено человеком — зелёным
-    var aiBtn=(!man && o.any && r.art)?'<button class="aib'+(o.ai?' on':'')+'" onmousedown="event.stopPropagation()" onclick="slAiOne('+i+',this)" title="'
-      +(o.ai?'Число посчитал ИИ по методичке. Нажмите, чтобы пересчитать заново':'Обновить: пересчитать эту строку ИИ по правилам методички')+'">'+(o.ai?'🤖':'↻')+'</button>':'';
-    return '<td class="order'+(man?' manual':'')+(good?' good':'')+'" title="'+slEsc(tip)+'">'+aiBtn+'<input data-i="'+i+'" data-c="'+ci
+    return '<td class="order'+(man?' manual':'')+(good?' good':'')+(!man&&o.ai?' ai':'')+'" title="'+slEsc(tip)+'"><input data-i="'+i+'" data-c="'+ci
       +'" value="'+slEsc(slFmt(slOrderVal(r)))+'"></td>';
   }
   var v=r[c.k]; v=(c.ty==='num')?slFmt(v):(v||'');
