@@ -490,6 +490,9 @@ def register(ctx):
                   border:1px solid var(--line);border-radius:6px}
   #slTable tr.cur td{background-color:#eaf3ff}
   #slTable tr.cur td.order{background-color:#ffd4a8}
+  #slTable td.order.good{background-color:#cdeed8}
+  #slTable td.order.good input{color:#166534}
+  #slTable tr.cur td.order.good{background-color:#b6e5c6}
   #slTable td.sel{background:#cfe0fb !important;box-shadow:inset 0 0 0 1px #8fb3ef}
   #slTable td.sel input{background:transparent}
   #slTable td.nm.miss{color:var(--mut);font-style:italic}
@@ -787,7 +790,8 @@ function slCellHtml(r,i,c,ci){
   if(c.k==='order'){
     var o=slOrder(r), man=r.order_manual!=null;
     var tip=man?('Исправлено вручную. Расчёт: '+(o.any?o.q:'—')+'\nОчистите ячейку, чтобы вернуть расчёт.\n\n'+o.why):o.why;
-    return '<td class="order'+(man?' manual':'')+'" title="'+slEsc(tip)+'"><input data-i="'+i+'" data-c="'+ci
+    var good=man||slStatus(r)==='Одобрено';   // проверено человеком — зелёным
+    return '<td class="order'+(man?' manual':'')+(good?' good':'')+'" title="'+slEsc(tip)+'"><input data-i="'+i+'" data-c="'+ci
       +'" value="'+slEsc(slFmt(slOrderVal(r)))+'"></td>';
   }
   var v=r[c.k]; v=(c.ty==='num')?slFmt(v):(v||'');
