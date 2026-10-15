@@ -446,7 +446,9 @@ def register(ctx):
   #slTable thead{position:sticky;top:0;z-index:2}
   #slTable tr.ttl th{user-select:none}
   #slTable th.csel{background:#dbe7fb}
-  #slTable th .ar{cursor:pointer;padding:0 2px}
+  #slTable tr.ttl th{position:relative;padding-right:20px}
+  #slTable th .ar{cursor:pointer;position:absolute;top:4px;right:3px;padding:1px 3px;border-radius:4px}
+  #slTable th .ar:hover{background:#e3edfb}
   #slTable th .ar.dim{color:#b8c0cc}
   #slTable th{background:var(--panel);white-space:normal;vertical-align:bottom;
               font-size:11px;line-height:1.25}
