@@ -459,7 +459,7 @@ def register(ctx):
     SECTION_HTML = """
   <h2 style="margin:0 0 4px">📈 Анализ продаж</h2>
   <p class="hint" style="margin:0 0 14px">Анализатор продаж Porsche (пробная версия).
-    Вносите позиции или вставляйте столбцы из Excel вместе с заголовком (Ctrl+V в ячейку первой строки) — заголовок отбросится. Блок ячеек выделяется мышкой или Shift+клик, весь столбец — кликом по заголовку; сортировка — значок ⇅: Ctrl+C — копия, Delete — очистка. Всё
+    Вносите позиции или вставляйте столбцы из Excel вместе с заголовком (Ctrl+V в ячейку первой строки) — заголовок отбросится. Блок ячеек выделяется мышкой или Shift+клик, весь столбец — кликом по заголовку, переставить столбец — потянуть заголовок мышкой; сортировка — значок ⇅: Ctrl+C — копия, Delete — очистка. Всё
     сохраняется на сервере автоматически.</p>
   <div class="bar">
     <button onclick="slNew()">Новая партия</button>
@@ -480,6 +480,7 @@ def register(ctx):
     <button onclick="slAddRow()">+ Строка</button>
     <button id="slAiAll" onclick="slAiRecalc()" title="Пересчитать ИИ по правилам методички все строки со статусом «Требует проверки». Одобренные и скорректированные не трогаются. Платный запрос к ИИ.">🤖 Пересчитать все</button>
     <button onclick="slResetOrder()" title="Снять фильтры и сортировку, выстроить строки по № от 1">↺ Вернуть исходный порядок</button>
+    <button id="slColReset" onclick="slColReset()" title="Вернуть столбцы на их обычные места" style="display:none">⇆ Столбцы по умолчанию</button>
     <button onclick="slExport()">⬇️ Скачать CSV</button>
     <button onclick="document.getElementById('slCatXls').click()"
             title="Excel-файл: столбец A — артикул, столбец B — наименование">📥 Загрузить справочник (Excel)</button>
@@ -554,6 +555,10 @@ def register(ctx):
   #slTable th{background:var(--panel);white-space:normal;vertical-align:bottom;
               font-size:11px;line-height:1.25}
   #slTable th.srt{cursor:pointer}
+  #slTable th.cdrag{opacity:.45}
+  #slColGhost{position:fixed;z-index:50;pointer-events:none;background:#fff;border:1px solid var(--blue);
+        border-radius:6px;padding:5px 9px;font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.18);max-width:220px}
+  #slColMark{position:fixed;z-index:49;pointer-events:none;width:3px;background:var(--blue);border-radius:2px}
   #slTable tr.flt th{padding:3px 4px;background:#f7f9fb;border-bottom:2px solid var(--line)}
   #slTable tr.flt input,#slTable tr.flt select{width:100%;box-sizing:border-box;padding:3px 5px;
         border:1px solid var(--line);border-radius:4px;font:12px/1.3 inherit;background:#fff;min-width:40px}
@@ -847,7 +852,7 @@ function slHead(){
   var t=document.getElementById('slTable');
   if(!t.tHead.rows.length){
     var h='<tr class="ttl">'; SL_COLS.forEach(function(c){
-      h+='<th class="'+c.ty+' srt" data-k="'+c.k+'" title="Клик — выделить весь столбец (Shift+клик — несколько столбцов); ⇅ — сортировка">'+c.t
+      h+='<th class="'+c.ty+' srt" data-k="'+c.k+'" title="Клик — выделить весь столбец (Shift+клик — несколько столбцов); ⇅ — сортировка; потянуть мышкой — переставить столбец">'+c.t
         +' <span class="ar" title="Сортировка: ▲ по возрастанию, ▼ по убыванию"><i class="u">▲</i><i class="d">▼</i></span></th>';});
     h+='<th></th></tr><tr class="flt">';
     SL_COLS.forEach(function(c){
@@ -889,9 +894,73 @@ function slResetOrder(){
   SL.rows.forEach(function(r,i){ r.n=i+1; });
   slSelClear(); slRender(); slSave();
 }
+/* ---------- перетаскивание столбцов мышкой за заголовок ----------
+   порядок запоминается в этом браузере (localStorage 'slColOrder') */
+var SL_COLS_DEF=SL_COLS.map(function(c){return c.k;});
+function slColApply(keys){
+  var by={}; SL_COLS.forEach(function(c){ by[c.k]=c; });
+  var out=[]; (keys||[]).forEach(function(k){ if(by[k]){ out.push(by[k]); delete by[k]; } });
+  // новые столбцы (появились в обновлении) — на своё обычное место, после соседа слева
+  SL_COLS_DEF.forEach(function(k,di){ if(!by[k]) return;
+    var prev=di?SL_COLS_DEF[di-1]:null, at=prev?out.findIndex(function(c){return c.k===prev;})+1:0;
+    out.splice(at,0,by[k]); delete by[k]; });
+  SL_COLS.length=0; out.forEach(function(c){ SL_COLS.push(c); });
+  slPasteCols();
+  var b=document.getElementById('slColReset');
+  if(b) b.style.display=SL_COLS.map(function(c){return c.k;}).join()===SL_COLS_DEF.join()?'none':'';
+}
+function slColSave(){ try{ localStorage.setItem('slColOrder', JSON.stringify(SL_COLS.map(function(c){return c.k;}))); }catch(e){} }
+function slColRebuild(){
+  var t=document.getElementById('slTable'); t.tHead.innerHTML='';
+  slSelClear(); slRender();
+}
+function slColReset(){ slColApply(SL_COLS_DEF); try{ localStorage.removeItem('slColOrder'); }catch(e){} slColRebuild(); }
+(function(){ var k=null; try{ k=JSON.parse(localStorage.getItem('slColOrder')||'null'); }catch(e){}
+  if(Array.isArray(k)) slColApply(k); })();
+SL.cdrag=null;
+document.addEventListener('mousedown', function(e){
+  var th=e.button===0 && e.target.closest && e.target.closest('#slTable tr.ttl th[data-k]');
+  if(!th || e.target.closest('.ar')) return;
+  SL.cdrag={k:th.dataset.k, x:e.clientX, y:e.clientY, on:false};
+});
+function slColTarget(x){
+  var ths=[].slice.call(document.querySelectorAll('#slTable tr.ttl th[data-k]'));
+  for(var i=0;i<ths.length;i++){ var r=ths[i].getBoundingClientRect(); if(x<r.left+r.width/2) return {i:i, x:r.left}; }
+  var l=ths[ths.length-1].getBoundingClientRect(); return {i:ths.length, x:l.right};
+}
+document.addEventListener('mousemove', function(e){
+  var d=SL.cdrag; if(!d) return;
+  if(!(e.buttons&1)){ slColDragEnd(null); return; }
+  if(!d.on){ if(Math.abs(e.clientX-d.x)<6 && Math.abs(e.clientY-d.y)<6) return;
+    d.on=true; var c=SL_COLS.find(function(c){return c.k===d.k;});
+    d.g=document.createElement('div'); d.g.id='slColGhost'; d.g.textContent='⇆ '+c.t; document.body.appendChild(d.g);
+    d.m=document.createElement('div'); d.m.id='slColMark'; document.body.appendChild(d.m);
+    var th=document.querySelector('#slTable tr.ttl th[data-k="'+d.k+'"]'); if(th) th.classList.add('cdrag');
+    if(window.getSelection) window.getSelection().removeAllRanges(); }
+  e.preventDefault();
+  d.g.style.left=(e.clientX+12)+'px'; d.g.style.top=(e.clientY+10)+'px';
+  var w=document.getElementById('slWrap').getBoundingClientRect(), tg=slColTarget(e.clientX);
+  d.m.style.left=(tg.x-1)+'px'; d.m.style.top=w.top+'px'; d.m.style.height=w.height+'px';
+  // у краёв таблицы — прокручиваем её вбок
+  var wr=document.getElementById('slWrap');
+  if(e.clientX>w.right-40) wr.scrollLeft+=20; else if(e.clientX<w.left+40) wr.scrollLeft-=20;
+});
+function slColDragEnd(e){
+  var d=SL.cdrag; SL.cdrag=null; if(!d || !d.on) return;
+  if(d.g) d.g.remove(); if(d.m) d.m.remove();
+  SL.colSkipClick=true; setTimeout(function(){ SL.colSkipClick=false; }, 0);
+  var th=document.querySelector('#slTable th.cdrag'); if(th) th.classList.remove('cdrag');
+  if(!e) return;
+  var from=SL_COLS.findIndex(function(c){return c.k===d.k;}), to=slColTarget(e.clientX).i;
+  if(to>from) to--; if(to===from) return;
+  var keys=SL_COLS.map(function(c){return c.k;}); keys.splice(to,0,keys.splice(from,1)[0]);
+  slColApply(keys); slColSave(); slColRebuild();
+}
+document.addEventListener('mouseup', function(e){ if(SL.cdrag) slColDragEnd(e); });
 document.addEventListener('click', function(e){
   var th=e.target.closest && e.target.closest('#slTable tr.ttl th[data-k]');
   if(!th) return;
+  if(SL.colSkipClick){ SL.colSkipClick=false; return; }
   if(e.target.closest('.ar')){ slSortBy(th.dataset.k); return; }
   slSelCol(SL_COLS.findIndex(function(c){return c.k===th.dataset.k;}), e.shiftKey);
 });
@@ -1154,7 +1223,9 @@ document.addEventListener('keydown', function(e){
 }, true);
 
 /* колонки, по которым раскладывается вставка из Excel (без служебной ✓/✎) */
-var SL_PASTE=SL_COLS.map(function(c,ci){return ci;}).filter(function(ci){return SL_COLS[ci].ty!=='status'&&SL_COLS[ci].ty!=='nid';});
+var SL_PASTE;
+function slPasteCols(){ SL_PASTE=SL_COLS.map(function(c,ci){return ci;}).filter(function(ci){return SL_COLS[ci].ty!=='status'&&SL_COLS[ci].ty!=='nid';}); }
+slPasteCols();
 async function slPasteAt(i0, c0, txt){
   var lines=txt.replace(/\r/g,'').split('\n');
   if(lines.length && lines[lines.length-1]==='') lines.pop();
