@@ -13,6 +13,8 @@
                         (как слепки в «Названиях»: открытый слепок
                         автосохраняется, «Новая партия» начинает новый)
   sales_catalog.json  — {артикул: наименование}
+  sales_vag.json      — [артикул, …] справочник VAG: такие позиции заказываются
+                        отдельно по прайсу VAG, в «В заказ» у них всегда 0
   sales_lessons.json  — «методичка заказа»: правки «В заказ» с причинами
                         [{snap, art, name, calc, manual, reason, period,
                           cover, row, at, updated}] — материал для ИИ
@@ -69,6 +71,7 @@ def register(ctx):
     SALES_PATH = os.path.join(ctx["data_dir"], "sales.json")
     CATALOG_PATH = os.path.join(ctx["data_dir"], "sales_catalog.json")
     LESSONS_PATH = os.path.join(ctx["data_dir"], "sales_lessons.json")
+    VAG_PATH = os.path.join(ctx["data_dir"], "sales_vag.json")
     SNAP_DIR = os.path.join(ctx["data_dir"], "sales_snapshots")
     os.makedirs(SNAP_DIR, exist_ok=True)
 
@@ -144,6 +147,33 @@ def register(ctx):
         cat = load_json(CATALOG_PATH, {})
         return {a: cat.get(a, "") for a in arts if a}
 
+    # справочник VAG держим в памяти, перечитываем при изменении файла
+    _vag = {"mt": None, "set": set()}
+
+    def vag_set():
+        mt = os.path.getmtime(VAG_PATH) if os.path.exists(VAG_PATH) else None
+        if mt != _vag["mt"]:
+            _vag["set"] = set(load_json(VAG_PATH, []))
+            _vag["mt"] = mt
+        return _vag["set"]
+
+    def vag_for(arts):
+        vs = vag_set()
+        return sorted({a for a in arts if a and a in vs})
+
+    def vag_merge(arts, replace=False):
+        """Добавляет артикулы в справочник VAG (replace — заменить весь список)."""
+        with lock:
+            old = set() if replace else set(load_json(VAG_PATH, []))
+            before = len(old)
+            new = {norm_art(a) for a in arts}
+            new.discard("")
+            old |= new
+            save_json(VAG_PATH, sorted(old))
+            _vag["mt"] = None
+        return {"ok": True, "added": len(old) - before, "got": len(new),
+                "vag_size": len(old)}
+
     # ---------- API ----------
 
     def deny():
@@ -176,7 +206,8 @@ def register(ctx):
                         "period": period,
                         "lessons_count": len(load_json(LESSONS_PATH, [])),
                         "id": data["current"], "snapshots": list_snaps(),
-                        "names": names, "catalog_size": len(cat)})
+                        "names": names, "catalog_size": len(cat),
+                        "vag": vag_for(arts), "vag_size": len(vag_set())})
 
     @app.post("/api/sales_save")
     def api_sales_save():
@@ -459,7 +490,7 @@ def register(ctx):
             return deny()
         d = request.get_json(force=True) or {}
         arts = [norm_art(a) for a in (d.get("arts") or [])][:5000]
-        return jsonify({"names": names_for(arts)})
+        return jsonify({"names": names_for(arts), "vag": vag_for(arts)})
 
     def catalog_merge(pairs):
         """Добавляет пары (артикул, наименование) в справочник."""
@@ -535,6 +566,67 @@ def register(ctx):
         res["skipped"] += bad
         return jsonify(res)
 
+    # ---------- Справочник VAG (просто список артикулов) ----------
+
+    def vag_cells(lines):
+        """Первая ячейка каждой строки; заголовок («Артикул», «Part No»…) пропускаем."""
+        out = []
+        for i, line in enumerate(lines):
+            cell = str(line or "").strip().strip('"').strip()
+            if not cell or cell.lower() == "nan":
+                continue
+            if i == 0 and not re.search(r"\d", cell):
+                continue
+            out.append(cell)
+        return out
+
+    @app.post("/api/sales_vag_add")
+    def api_sales_vag_add():
+        """Текст: по артикулу в строке (из Excel можно вставить столбец)."""
+        if not check_auth(request):
+            return deny()
+        d = request.get_json(force=True) or {}
+        lines = [re.split(r"\t|;", ln, maxsplit=1)[0]
+                 for ln in str(d.get("text") or "").splitlines()]
+        arts = vag_cells(lines)
+        if not arts and not d.get("replace"):
+            return jsonify({"error": "Не нашёл ни одного артикула"}), 400
+        return jsonify(vag_merge(arts, bool(d.get("replace"))))
+
+    @app.post("/api/sales_vag_upload")
+    def api_sales_vag_upload():
+        """Файл Excel/CSV: артикулы в первом заполненном столбце."""
+        if not check_auth(request):
+            return deny()
+        f = request.files.get("file")
+        if f is None:
+            return jsonify({"error": "Файл не получен"}), 400
+        import io
+        import pandas as pd
+        fn = (f.filename or "").lower()
+        try:
+            data = f.read()
+            if fn.endswith((".csv", ".txt", ".tsv")):
+                df = pd.read_csv(io.BytesIO(data), sep=None, engine="python",
+                                 dtype=str, header=None, encoding="utf-8-sig")
+            else:
+                df = pd.read_excel(io.BytesIO(data), dtype=str, header=None)
+        except Exception as e:
+            return jsonify({"error": f"Не удалось прочитать файл: {e}"}), 400
+        cols = [c for c in df.columns if df[c].notna().any()]
+        if not cols:
+            return jsonify({"error": "Файл пустой"}), 400
+        arts = vag_cells(df[cols[0]].fillna("").tolist())
+        if not arts:
+            return jsonify({"error": "Не нашёл ни одного артикула"}), 400
+        return jsonify(vag_merge(arts, request.form.get("replace") == "1"))
+
+    @app.post("/api/sales_vag_clear")
+    def api_sales_vag_clear():
+        if not check_auth(request):
+            return deny()
+        return jsonify(vag_merge([], replace=True))
+
     # ---------- Что отдаём ядру для оболочки ----------
 
     SECTION_HTML = """
@@ -569,6 +661,7 @@ def register(ctx):
     <input type="file" id="slCatXls" accept=".xlsx,.xls,.xlsm,.csv,.txt,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" style="display:none"
            onchange="slCatUpload(this)">
     <button onclick="slToggleCat()">📚 Справочник <span id="slCatCnt" class="hint"></span></button>
+    <button onclick="slToggleVag()" title="Список артикулов VAG: такие позиции заказываются отдельно по прайсу VAG, у них «В заказ» всегда 0">🅥 VAG <span id="slVagCnt" class="hint"></span></button>
     <label class="hint" title="При вставке из Excel первая строка (название столбца) отбрасывается">
       <input type="checkbox" id="slSkipHead" checked> Убирать заголовок при вставке</label>
     <span id="slStCnt" class="slstcnt"></span>
@@ -585,6 +678,22 @@ def register(ctx):
       <button class="primary" onclick="slCatAdd()">Добавить в справочник</button>
       <button onclick="document.getElementById('slCatXls').click()">📥 Загрузить файл Excel</button>
       <span id="slCatMsg" class="hint"></span>
+    </div>
+  </div>
+  <div id="slVag" class="panel" style="display:none;padding:12px 14px;margin-bottom:12px">
+    <div class="hint" style="margin-bottom:6px">Справочник VAG — просто список артикулов.
+      Если артикул (или артикул замены) из таблицы есть в этом списке, у позиции
+      «В заказ» всегда 0 и статус «VAG»: её заказывают отдельно по прайсу VAG.
+      Вставьте столбец артикулов из Excel (по одному в строке) или загрузите файл
+      (артикулы — в первом столбце). Пробелы и точки в артикулах не важны.</div>
+    <textarea id="slVagText" rows="6" placeholder="1K0615301AA&#10;06H 115 562"></textarea>
+    <div class="bar" style="margin:8px 0 0">
+      <button class="primary" onclick="slVagAdd(false)">Добавить в список</button>
+      <button onclick="slVagAdd(true)" title="Удалить старый список и записать вставленный">Заменить весь список</button>
+      <button onclick="document.getElementById('slVagXls').click()">📥 Загрузить файл Excel (добавить)</button>
+      <input type="file" id="slVagXls" accept=".xlsx,.xls,.xlsm,.csv,.txt" style="display:none" onchange="slVagUpload(this)">
+      <button onclick="slVagClear()">🗑 Очистить список</button>
+      <span id="slVagMsg" class="hint"></span>
     </div>
   </div>
   <div id="slDlg" class="sldlg" style="display:none">
@@ -663,6 +772,9 @@ def register(ctx):
   #slTable td.st{white-space:nowrap;padding:0 4px}
   #slTable td.st .chip{font-size:11px;padding:2px 7px;margin-right:3px}
   #sec-sales .chip.fixed{background:#e3edfb;color:var(--blue)}
+  #sec-sales .chip.vag{background:#ede9fe;color:#6d28d9}
+  #slTable td.order.vag{background:#f3f0ff}
+  #slTable td.order.vag input{color:#6d28d9;font-weight:700}
   .slstcnt .chip{font-size:11px;padding:2px 8px}
   #slTable td.st button.stb{border:1px solid var(--line);background:#fff;border-radius:5px;padding:1px 5px;
         margin-left:2px;font-size:13px;cursor:pointer;color:var(--mut)}
@@ -687,6 +799,7 @@ def register(ctx):
   #slTable td.order.good{background-color:#cdeed8}
   #slTable td.order.good input{color:#166534}
   #slTable tr.cur td.order.good{background-color:#b6e5c6}
+  #slTable tr.cur td.order.vag{background-color:#e6e0ff}
   #slTable td.sel{background:#d6e5fc !important;border-color:#d6e5fc}   /* внутри блока — без сетки, рамка только снаружи */
   #slTable td.sel input{background:transparent}
   #slTable td.nm.miss{color:var(--mut);font-style:italic}
@@ -708,7 +821,7 @@ def register(ctx):
          font:inherit;margin-left:4px}
   #slSearch{flex:1;min-width:200px;max-width:320px;padding:7px 10px;
             border:1px solid var(--line);border-radius:6px;font:inherit}
-  #slCatText{width:100%;box-sizing:border-box;font-family:var(--mono);font-size:12px;
+  #slCatText,#slVagText{width:100%;box-sizing:border-box;font-family:var(--mono);font-size:12px;
              border:1px solid var(--line);border-radius:6px;padding:8px}
 """
 
@@ -733,7 +846,7 @@ var SL_COLS = [
   {k:'transit',    t:'В пути',                      ty:'num'},
   {k:'year',       t:'Продажи за год (365 дн.)',    ty:'num'}
 ];
-var SL = {colf:{}, sort:null, rows:[], names:{}, settings:{period_days:90, cover_days:60}, loaded:false, id:null, period:{},
+var SL = {colf:{}, sort:null, rows:[], names:{}, vag:{}, settings:{period_days:90, cover_days:60}, loaded:false, id:null, period:{},
           saveTimer:null, filter:''};
 var SL_CYR = {'А':'A','В':'B','Е':'E','К':'K','М':'M','Н':'H','О':'O','Р':'P','С':'C',
               'Т':'T','Х':'X','У':'Y'};
@@ -772,7 +885,11 @@ function slShowDays(){
     :('период не указан, считаю как '+(SL.settings.period_days||90)+' дн.');
   el.classList.toggle('warn', !d);
 }
+/* артикул (или замена) есть в справочнике VAG — заказ отдельно по прайсу VAG, здесь 0 */
+function slIsVag(r){ return !!(r.art && SL.vag[r.art]) || !!(r.repl && SL.vag[r.repl]); }
 function slOrder(r){
+  if(slIsVag(r)) return {q:0, any:true, vag:true,
+    why:'Артикул '+(SL.vag[r.art]?r.art:r.repl)+' есть в справочнике VAG — заказывается отдельно по прайс-листу VAG, поэтому здесь 0.'};
   var P=slPeriodDays()||SL.settings.period_days||90, C=SL.settings.cover_days||60;
   var tot=slTotal(r)||0, yr=r.year||0;
   var rp=tot/P, ry=yr/365, rate;
@@ -851,6 +968,7 @@ async function slAiOne(i, btn){
   finally { slRefreshRow(i); }
 }
 function slOrderVal(r){
+  if(slIsVag(r)) return 0;
   if(r.order_manual!=null) return r.order_manual;
   var o=slOrder(r); return o.any?o.q:null;
 }
@@ -929,6 +1047,7 @@ async function slFetch(q){
   var d=await apiGet('/api/sales'+(q||''));
   if(d.error){ alert(d.error); return false; }
   SL.rows=d.rows||[]; SL.names=d.names||{}; SL.settings=d.settings||SL.settings;
+  SL.vag={}; (d.vag||[]).forEach(function(a){ SL.vag[a]=1; }); slVagCount(d.vag_size);
   SL.id=d.id||null; SL.period=d.period||{}; slSnapList(d.snapshots);
   ['from','to'].forEach(function(k){   // битый год (0002…) из старой версии — сбросить
     if(SL.period[k] && !/^20\d\d-/.test(SL.period[k])) SL.period[k]=''; });
@@ -1181,6 +1300,7 @@ function slCellHtml(r,i,c,ci){
   if(c.k==='total') return '<td class="calc">'+slFmt(slTotal(r))+'</td>';
   if(c.ty==='status'){
     var st=slStatus(r); if(!st) return '<td class="st"></td>';
+    if(st==='VAG') return '<td class="st" title="Заказывается отдельно по прайс-листу VAG"><span class="chip vag">VAG</span></td>';
     var tipS=st==='Скорректировано'?'Ваша причина: '+(r.order_reason||'—')
       :st==='Одобрено'?'Расчёт ИИ подтверждён без правок':'Количество посчитано ИИ — проверьте и подтвердите ✓ или исправьте ✎';
     return '<td class="st" title="'+slEsc(tipS)+'"><span class="chip '+SL_ST_CLS[st]+'">'+st+'</span>'
@@ -1194,6 +1314,7 @@ function slCellHtml(r,i,c,ci){
   }
   if(c.k==='order'){
     var o=slOrder(r), man=r.order_manual!=null;
+    if(o.vag) return '<td class="order vag" title="'+slEsc(o.why)+'"><input data-i="'+i+'" data-c="'+ci+'" value="0" readonly></td>';
     var tip=man?('Исправлено вручную. Расчёт: '+(o.any?o.q:'—')+'\nОчистите ячейку, чтобы вернуть расчёт.\n\n'+o.why):o.why;
     var good=man||slStatus(r)==='Одобрено';   // проверено человеком — зелёным
     return '<td class="order'+(man?' manual':'')+(good?' good':'')+(!man&&o.ai?' ai':'')+'" title="'+slEsc(tip)+'"><input data-i="'+i+'" data-c="'+ci
@@ -1236,6 +1357,8 @@ async function slLookup(arts){
   try{
     var d=await api('/api/sales_names',{arts:arts});
     Object.keys(d.names||{}).forEach(function(a){ SL.names[a]=d.names[a]; });
+    arts.forEach(function(a){ delete SL.vag[a]; });
+    (d.vag||[]).forEach(function(a){ SL.vag[a]=1; });
   }catch(e){}
 }
 async function slSaveNow(){
@@ -1291,6 +1414,7 @@ document.addEventListener('paste', async function(e){
 function slOrderEdited(i, el){
   var r=SL.rows[i], v=slNum(el.value), o=slOrder(r);
   el.blur();
+  if(o.vag){ slRefreshRow(i); return; }   // VAG — всегда 0
   if(v==null){ if(r.order_manual!=null){ slClearManual(i); slSave(); } slRefreshRow(i); return; }
   if(r.order_manual==null && o.any && v===o.q){ slRefreshRow(i); return; }      // совпало с расчётом
   if(r.order_manual!=null && v===r.order_manual){ slRefreshRow(i); return; }    // не изменилось
@@ -1311,12 +1435,13 @@ function slAsk(i, qty){
   setTimeout(function(){ document.getElementById('slDlgText').focus(); },30);
 }
 function slEditReason(i){ var r=SL.rows[i], o=slOrder(r);
+  if(o.vag) return;
   if(!r.art){ alert('Сначала укажите артикул в этой строке.'); return; }
   slAsk(i, r.order_manual!=null?r.order_manual:(o.any?o.q:null)); }
 /* статус строки: правка с причиной → «Скорректировано»; ✓ на текущем расчёте → «Одобрено»;
    иначе расчёт ИИ «Требует проверки» (одобрение слетает, если расчёт поменялся) */
-var SL_ST=['Требует проверки','Одобрено','Скорректировано'];
-var SL_ST_CLS={'Требует проверки':'done','Одобрено':'ok','Скорректировано':'fixed'};
+var SL_ST=['Требует проверки','Одобрено','Скорректировано','VAG'];
+var SL_ST_CLS={'Требует проверки':'done','Одобрено':'ok','Скорректировано':'fixed','VAG':'vag'};
 function slStCount(){
   var c={}; SL.rows.forEach(function(r){ var s=slStatus(r); if(s) c[s]=(c[s]||0)+1; });
   var el=document.getElementById('slStCnt'); if(!el) return;
@@ -1324,6 +1449,7 @@ function slStCount(){
     return '<span class="chip '+SL_ST_CLS[s]+'">'+s+': '+c[s]+'</span>'; }).join(' ');
 }
 function slStatus(r){
+  if(slIsVag(r)) return r.art?'VAG':'';
   if(r.order_manual!=null) return 'Скорректировано';
   var o=slOrder(r); if(!o.any) return '';
   return (r.order_ok!=null && r.order_ok===o.q)?'Одобрено':'Требует проверки';
@@ -1542,6 +1668,49 @@ function slDelRow(i){
   var r=SL.rows[i];
   if((r.art||r.comment) && !confirm('Удалить строку '+(r.art||'')+'?')) return;
   SL.rows.splice(i,1); slRender(); slSave();
+}
+function slVagCount(n){ var e=document.getElementById('slVagCnt'); if(e) e.textContent=n?'('+n+')':''; }
+function slToggleVag(){ var p=document.getElementById('slVag');
+  p.style.display=p.style.display==='none'?'':'none'; }
+async function slVagRefresh(d){
+  slVagCount(d.vag_size);
+  var arts=[].concat.apply([],SL.rows.map(function(r){return [r.art,r.repl];})).filter(Boolean);
+  SL.vag={};
+  if(arts.length){ var x=await api('/api/sales_names',{arts:arts}); (x.vag||[]).forEach(function(a){ SL.vag[a]=1; }); }
+  slRender();
+  var n=SL.rows.filter(slIsVag).length;
+  return ' В текущей таблице позиций VAG: '+n+'.';
+}
+async function slVagAdd(replace){
+  var ta=document.getElementById('slVagText'), msg=document.getElementById('slVagMsg');
+  if(!ta.value.trim() && !replace){ msg.textContent='Вставьте артикулы, по одному в строке.'; return; }
+  if(replace && !confirm('Удалить весь старый список VAG и записать вставленный?')) return;
+  msg.textContent='Загружаю…';
+  try{
+    var d=await api('/api/sales_vag_add',{text:ta.value, replace:replace});
+    if(d.error){ msg.textContent=d.error; return; }
+    ta.value='';
+    msg.textContent='Получено артикулов: '+d.got+', новых: '+d.added+'. Всего в списке VAG: '+d.vag_size+'.'+await slVagRefresh(d);
+  }catch(e){ msg.textContent='Не удалось загрузить.'; }
+}
+async function slVagUpload(inp){
+  var f=inp.files&&inp.files[0]; if(!f) return; inp.value='';
+  var msg=document.getElementById('slVagMsg'); msg.textContent='Загружаю файл…';
+  try{
+    var fd=new FormData(); fd.append('file',f);
+    var res=await fetch('/api/sales_vag_upload',{method:'POST',headers:{'X-Auth':AUTH},body:fd});
+    if(res.status===401){ msg.textContent='Нужен пароль'; return; }
+    var d=await res.json();
+    if(d.error){ msg.textContent='Ошибка: '+d.error; return; }
+    msg.textContent='Из файла артикулов: '+d.got+', новых: '+d.added+'. Всего в списке VAG: '+d.vag_size+'.'+await slVagRefresh(d);
+  }catch(e){ msg.textContent='⚠️ Не удалось загрузить файл'; }
+}
+async function slVagClear(){
+  if(!confirm('Очистить весь список VAG?')) return;
+  var msg=document.getElementById('slVagMsg');
+  try{ var d=await api('/api/sales_vag_clear',{});
+    msg.textContent='Список VAG очищен.'+await slVagRefresh(d); }
+  catch(e){ msg.textContent='Не удалось очистить.'; }
 }
 function slToggleCat(){ var p=document.getElementById('slCat');
   p.style.display=p.style.display==='none'?'':'none'; }
