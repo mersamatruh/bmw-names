@@ -958,16 +958,40 @@ function slCellText(r,c){
   if(col.ty==='nid') return r.n||'';
   return col.ty==='num'?slFmt(r[col.k]):(r[col.k]||'');
 }
-document.addEventListener('copy', function(e){
-  if(!SL.sel || SL.dlg || !slSecVisible() || slInHead()) return;
-  var ae=document.activeElement;
-  if(!slSelMulti() && ae && ae.tagName==='INPUT') return;   // обычная копия текста в ячейке
+function slSelText(){
   var b=slSelBox(), trs=document.querySelectorAll('#slTable tbody tr'), out=[];
   for(var r=b.r1;r<=b.r2;r++){ var tr=trs[r]; if(!tr) continue; var row=SL.rows[+tr.dataset.i], line=[];
     for(var c=b.c1;c<=b.c2;c++) line.push((slCellText(row,c)+'').replace(/[\t\n]/g,' '));
     out.push(line.join('\t')); }
-  e.clipboardData.setData('text/plain', out.join('\r\n')); e.preventDefault();
-  document.getElementById('slSaved').textContent='Скопировано ячеек: '+((b.r2-b.r1+1)*(b.c2-b.c1+1));
+  return {text:out.join('\r\n'), n:(b.r2-b.r1+1)*(b.c2-b.c1+1)};
+}
+/* копировать ли блок: выделено несколько ячеек, или одна, но в ней не выделен кусок текста */
+function slCopyWanted(){
+  if(!SL.sel || SL.dlg || !slSecVisible() || slInHead() || SL.copying) return false;
+  if(slSelMulti()) return true;
+  var ae=document.activeElement;
+  if(ae && ae.tagName==='INPUT' && ae.selectionStart!==ae.selectionEnd) return false;  // обычная копия куска текста
+  return true;
+}
+function slCopyDone(n){ document.getElementById('slSaved').textContent='Скопировано ячеек: '+n; }
+document.addEventListener('copy', function(e){
+  if(!slCopyWanted()) return;
+  var t=slSelText(); e.clipboardData.setData('text/plain', t.text); e.preventDefault(); slCopyDone(t.n);
+});
+/* Ctrl+C ловим сами: браузер не всегда шлёт событие copy, когда фокуса нет
+   (после выделения мышкой) — тогда копируем через скрытое поле */
+document.addEventListener('keydown', function(e){
+  if(!(e.ctrlKey||e.metaKey) || e.altKey || e.code!=='KeyC' || !slCopyWanted()) return;
+  e.preventDefault();
+  var t=slSelText(), ae=document.activeElement, ok=false;
+  var ta=document.createElement('textarea'); ta.value=t.text;
+  ta.style.cssText='position:fixed;left:-9999px;top:0;opacity:0';
+  document.body.appendChild(ta); ta.select();
+  SL.copying=true; try{ ok=document.execCommand('copy'); }catch(err){} SL.copying=false;
+  document.body.removeChild(ta);
+  if(ae && ae.focus && ae!==document.body) ae.focus({preventScroll:true});
+  if(!ok && navigator.clipboard) navigator.clipboard.writeText(t.text).then(function(){ slCopyDone(t.n); });
+  else if(ok) slCopyDone(t.n);
 });
 document.addEventListener('keydown', function(e){
   if(!SL.sel || SL.dlg || !slSecVisible() || slInHead()) return;
