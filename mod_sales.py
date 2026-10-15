@@ -28,7 +28,8 @@ import datetime
 TEXT_FIELDS = ("art", "repl", "comment", "order_reason")
 NUM_FIELDS = ("profit", "turn_de", "sold_de", "sold_sup", "sold_stock",
               "stock", "ordered", "transit", "year",
-              "order_manual")  # «в заказ», исправленное вручную
+              "order_manual",  # «в заказ», исправленное вручную
+              "order_ok")      # одобренное (✓) расчётное количество
 
 # Кириллица, похожая на латиницу, — чтобы «А123» с русской раскладки
 # не превращался в другой артикул.
@@ -215,23 +216,26 @@ def register(ctx):
         d = request.get_json(force=True) or {}
         snap, art = str(d.get("snap") or ""), norm_art(d.get("art"))
         reason = str(d.get("reason") or "").strip()[:2000]
-        if not snap or not art or not reason:
+        approved = bool(d.get("approved"))   # ✓ — расчёт ИИ признан верным, без причины
+        if not snap or not art or not (reason or approved):
             return jsonify({"error": "Нужны слепок, артикул и причина"}), 400
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
         rec = {"snap": snap, "art": art, "repl": norm_art(d.get("repl")),
                "name": str(d.get("name") or "")[:300],
                "calc": parse_num(d.get("calc")), "manual": parse_num(d.get("manual")),
+               "kind": "approved" if approved else "corrected",
                "reason": reason, "period": d.get("period") or {},
                "cover": parse_num(d.get("cover")),
                "row": {k: parse_num((d.get("row") or {}).get(k)) for k in NUM_FIELDS
-                       if k != "order_manual"}}
+                       if k not in ("order_manual", "order_ok")}}
         with lock:
             lessons = load_json(LESSONS_PATH, [])
             for old in lessons:
                 if old.get("snap") == snap and old.get("art") == art:
-                    if old.get("reason") != reason:
+                    if old.get("reason") != reason or old.get("kind") != rec["kind"]:
                         old.setdefault("history", []).append(
-                            {"reason": old.get("reason"), "manual": old.get("manual"),
+                            {"kind": old.get("kind") or "corrected",
+                             "reason": old.get("reason"), "manual": old.get("manual"),
                              "at": old.get("updated") or old.get("at")})
                     old.update(rec)
                     old["updated"] = now
@@ -392,6 +396,7 @@ def register(ctx):
     <button onclick="slToggleCat()">📚 Справочник <span id="slCatCnt" class="hint"></span></button>
     <label class="hint" title="При вставке из Excel первая строка (название столбца) отбрасывается">
       <input type="checkbox" id="slSkipHead" checked> Убирать заголовок при вставке</label>
+    <span id="slStCnt" class="slstcnt"></span>
     <span id="slLessons" class="hint" title="Правки «В заказ» с причинами — из них будет учиться ИИ"></span>
     <span id="slSaved" class="hint"></span>
   </div>
@@ -427,8 +432,9 @@ def register(ctx):
   <p class="hint" style="margin-top:10px">«В заказ» считается формулой: средний
     дневной спрос (60% — выбранный период, 40% — последние 365 дней) × дней запаса
     (по умолчанию 60 = 2 месяца) − наличие − уже заказано. Наведите на число, чтобы
-    увидеть расчёт. Если исправить число — спросим причину; правка станет жирной, а в
-    колонке справа появится ✎ (нажмите, чтобы поправить причину). ✓ — расчёт принят.</p>
+    увидеть расчёт. Статус: «Требует проверки» — число посчитал ИИ; ✓ — количество верное,
+    статус «Одобрено» (без комментария); ✎ или правка числа — спросим причину, статус
+    «Скорректировано». Одобрения и правки копятся в методичке для обучения ИИ.</p>
 """
 
     CSS = """
@@ -465,9 +471,14 @@ def register(ctx):
   #slTable td.order.manual input{font-weight:800;color:#c2410c;text-decoration:underline dotted}
   #slTable th.order{background:#ffd3a3;color:#7a3a00}
   #slTable td.nm{padding:6px 8px;font-size:12px;min-width:180px}
-  #slTable td.st{text-align:center;width:34px;padding:0 4px;font-size:15px}
-  #slTable td.st.ok{color:#15803d}
-  #slTable td.st button{border:none;background:none;padding:2px 4px;font-size:15px;cursor:pointer}
+  #slTable td.st{white-space:nowrap;padding:0 4px}
+  #slTable td.st .chip{font-size:11px;padding:2px 7px;margin-right:3px}
+  #sec-sales .chip.fixed{background:#e3edfb;color:var(--blue)}
+  .slstcnt .chip{font-size:11px;padding:2px 8px}
+  #slTable td.st button.stb{border:1px solid var(--line);background:#fff;border-radius:5px;padding:1px 5px;
+        margin-left:2px;font-size:13px;cursor:pointer;color:var(--mut)}
+  #slTable td.st button.stb:hover{border-color:var(--blue);color:var(--blue)}
+  #slTable td.st button.stb.on{background:#eef4fe;border-color:var(--blue);color:var(--blue)}
   #slTable th.status{text-align:center;white-space:nowrap}
   .sldate{padding:5px 6px;border:1px solid var(--line);border-radius:6px;font:inherit;margin:0 2px}
   #slDays.warn{color:#c2410c;font-weight:600}
@@ -507,7 +518,7 @@ var SL_COLS = [
   {k:'sold_stock', t:'Продано за период склад',     ty:'num'},
   {k:'total',      t:'Общие продажи',               ty:'calc'},
   {k:'order',      t:'В заказ',                     ty:'order'},
-  {k:'status',     t:'✓ / ✎',                       ty:'status'},
+  {k:'status',     t:'Статус',                      ty:'status'},
   {k:'comment',    t:'Комментарий',                 ty:'text'},
   {k:'stock',      t:'Наше наличие',                ty:'num'},
   {k:'ordered',    t:'Кол-во заказано',             ty:'num'},
@@ -627,7 +638,7 @@ async function slLoad(){
   }catch(e){ document.getElementById('slSaved').textContent='Не удалось загрузить таблицу.'; }
 }
 function slLessonsCount(n){
-  var w=(n%10===1&&n%100!==11)?'правка':((n%10>=2&&n%10<=4&&(n%100<10||n%100>=20))?'правки':'правок');
+  var w=(n%10===1&&n%100!==11)?'запись':((n%10>=2&&n%10<=4&&(n%100<10||n%100>=20))?'записи':'записей');
   document.getElementById('slLessons').textContent=n?('📘 Методичка: '+n+' '+w):''; }
 function slCatCount(n){ document.getElementById('slCatCnt').textContent=n?'('+n+')':''; }
 
@@ -664,7 +675,8 @@ function slHead(){
         +' <span class="ar" title="Сортировка">⇅</span></th>';});
     h+='<th></th></tr><tr class="flt">';
     SL_COLS.forEach(function(c){
-      if(c.ty==='status') h+='<th><select data-f="status"><option value="">все</option><option>✓</option><option>✎</option></select></th>';
+      if(c.ty==='status') h+='<th><select data-f="status"><option value="">все</option>'
+        +SL_ST.map(function(s){return '<option>'+s+'</option>';}).join('')+'</select></th>';
       else h+='<th><input data-f="'+c.k+'" placeholder="🔍" title="'+(c.ty==='num'||c.ty==='calc'||c.ty==='order'||c.ty==='nid'
         ?'Число: &gt;5, &lt;3, &gt;=10, =0; или «пусто» / «не пусто»':'Текст содержит…; или «пусто» / «не пусто»')+'"></th>';
     });
@@ -730,7 +742,7 @@ function slRender(){
   SL.rows.forEach(function(r,i){ if(slVisible(i)) b+=slRowHtml(r,i); });
   t.tBodies[0].innerHTML=b;
   if(SL.sel) slSelPaint();
-  slCurPaint();
+  slCurPaint(); slStCount();
 }
 /* текущая строка (где щёлкнули/стоит курсор) подсвечивается голубым — только для глаз,
    на копирование не влияет */
@@ -763,9 +775,14 @@ function slCellHtml(r,i,c,ci){
   }
   if(c.k==='total') return '<td class="calc">'+slFmt(slTotal(r))+'</td>';
   if(c.ty==='status'){
-    if(r.order_manual!=null) return '<td class="st" title="'+slEsc('Ваша причина: '+(r.order_reason||'—')+'\nНажмите, чтобы изменить')
-      +'"><button onclick="slEditReason('+i+')">✎</button></td>';
-    return slOrder(r).any?'<td class="st ok" title="Расчёт принят без правок">✓</td>':'<td class="st"></td>';
+    var st=slStatus(r); if(!st) return '<td class="st"></td>';
+    var tipS=st==='Скорректировано'?'Ваша причина: '+(r.order_reason||'—')
+      :st==='Одобрено'?'Расчёт ИИ подтверждён без правок':'Количество посчитано ИИ — проверьте и подтвердите ✓ или исправьте ✎';
+    return '<td class="st" title="'+slEsc(tipS)+'"><span class="chip '+SL_ST_CLS[st]+'">'+st+'</span>'
+      +'<button class="stb'+(st==='Одобрено'?' on':'')+'" onclick="slApprove('+i+')" title="'
+      +(st==='Одобрено'?'Снять одобрение':st==='Скорректировано'?'Отменить правку и одобрить расчёт ИИ':'Количество верное — одобрить')+'">✓</button>'
+      +'<button class="stb'+(st==='Скорректировано'?' on':'')+'" onclick="slEditReason('+i+')" title="'
+      +(st==='Скорректировано'?'Изменить количество / причину':'Исправить количество с причиной')+'">✎</button></td>';
   }
   if(c.k==='order'){
     var o=slOrder(r), man=r.order_manual!=null;
@@ -776,7 +793,7 @@ function slCellHtml(r,i,c,ci){
   var v=r[c.k]; v=(c.ty==='num')?slFmt(v):(v||'');
   return '<td class="'+c.ty+'"><input data-i="'+i+'" data-c="'+ci+'" value="'+slEsc(v)+'"></td>';
 }
-function slRefreshRow(i){
+function slRefreshRow(i, noCount){
   var tr=document.querySelector('#slTable tr[data-i="'+i+'"]'); if(!tr) return;
   var r=SL.rows[i];
   SL_COLS.forEach(function(c,ci){
@@ -787,8 +804,9 @@ function slRefreshRow(i){
       tr.replaceChild(tmp.firstChild.firstChild, tr.children[ci]);
     }
   });
+  if(!noCount) slStCount();
 }
-function slRefreshCalc(){ SL.rows.forEach(function(r,i){ slRefreshRow(i); }); }
+function slRefreshCalc(){ SL.rows.forEach(function(r,i){ slRefreshRow(i, true); }); slStCount(); }
 
 function slSetCell(i,ci,raw){
   var c=SL_COLS[ci], r=SL.rows[i];
@@ -883,7 +901,46 @@ function slAsk(i, qty){
   document.getElementById('slDlg').style.display='flex';
   setTimeout(function(){ document.getElementById('slDlgText').focus(); },30);
 }
-function slEditReason(i){ slAsk(i, SL.rows[i].order_manual); }
+function slEditReason(i){ var r=SL.rows[i], o=slOrder(r);
+  if(!r.art){ alert('Сначала укажите артикул в этой строке.'); return; }
+  slAsk(i, r.order_manual!=null?r.order_manual:(o.any?o.q:null)); }
+/* статус строки: правка с причиной → «Скорректировано»; ✓ на текущем расчёте → «Одобрено»;
+   иначе расчёт ИИ «Требует проверки» (одобрение слетает, если расчёт поменялся) */
+var SL_ST=['Требует проверки','Одобрено','Скорректировано'];
+var SL_ST_CLS={'Требует проверки':'done','Одобрено':'ok','Скорректировано':'fixed'};
+function slStCount(){
+  var c={}; SL.rows.forEach(function(r){ var s=slStatus(r); if(s) c[s]=(c[s]||0)+1; });
+  var el=document.getElementById('slStCnt'); if(!el) return;
+  el.innerHTML=SL_ST.filter(function(s){return c[s];}).map(function(s){
+    return '<span class="chip '+SL_ST_CLS[s]+'">'+s+': '+c[s]+'</span>'; }).join(' ');
+}
+function slStatus(r){
+  if(r.order_manual!=null) return 'Скорректировано';
+  var o=slOrder(r); if(!o.any) return '';
+  return (r.order_ok!=null && r.order_ok===o.q)?'Одобрено':'Требует проверки';
+}
+function slLessonRow(r){ var row={};
+  ['profit','turn_de','sold_de','sold_sup','sold_stock','stock','ordered','transit','year']
+    .forEach(function(k){ row[k]=r[k]; }); return row; }
+async function slApprove(i){
+  var r=SL.rows[i], o=slOrder(r);
+  if(!r.art){ alert('Сначала укажите артикул в этой строке.'); return; }
+  if(slStatus(r)==='Одобрено'){            // повторный клик — снять одобрение
+    r.order_ok=null; slRefreshRow(i); slSave();
+    if(SL.id) api('/api/sales_lesson_del',{snap:SL.id, art:r.art})
+      .then(function(res){ if(res&&res.ok) slLessonsCount(res.lessons_count); }).catch(function(){});
+    return;
+  }
+  if(!o.any) return;
+  r.order_manual=null; r.order_reason=''; r.order_ok=o.q; slRefreshRow(i);
+  clearTimeout(SL.saveTimer); SL.saveTimer=null; await slSaveNow();   // нужен id слепка
+  try{
+    var p=SL.period; var res=await api('/api/sales_lesson',{snap:SL.id, art:r.art, repl:r.repl, name:slName(r),
+      approved:true, calc:o.q, manual:o.q, reason:'', cover:SL.settings.cover_days,
+      period:{from:p.from||'', to:p.to||'', days:slPeriodDays()}, row:slLessonRow(r)});
+    if(res.ok) slLessonsCount(res.lessons_count);
+  }catch(e){}
+}
 function slDlgClose(){ document.getElementById('slDlg').style.display='none'; var d=SL.dlg; SL.dlg=null; if(d) slRefreshRow(d.i); }
 function slDlgCancel(){ slDlgClose(); }
 function slDlgReset(){ var d=SL.dlg; if(!d) return; slClearManual(d.i); slDlgClose(); slSave(); }
@@ -894,12 +951,11 @@ async function slDlgOk(){
   if(qty==null){ err.textContent='Укажите количество.'; return; }
   if(!reason){ err.textContent='Причина обязательна — напишите, почему именно столько.'; return; }
   var r=SL.rows[d.i], o=slOrder(r);
-  r.order_manual=qty; r.order_reason=reason;
+  r.order_manual=qty; r.order_reason=reason; r.order_ok=null;
   slDlgClose();
   clearTimeout(SL.saveTimer); SL.saveTimer=null; await slSaveNow();   // нужен id слепка
   try{
-    var row={}; ['profit','turn_de','sold_de','sold_sup','sold_stock','stock','ordered','transit','year']
-      .forEach(function(k){ row[k]=r[k]; });
+    var row=slLessonRow(r);
     var p=SL.period; var res=await api('/api/sales_lesson',{snap:SL.id, art:r.art, repl:r.repl, name:slName(r),
       calc:o.any?o.q:null, manual:qty, reason:reason, cover:SL.settings.cover_days,
       period:{from:p.from||'', to:p.to||'', days:slPeriodDays()}, row:row});
@@ -907,7 +963,7 @@ async function slDlgOk(){
   }catch(e){}
 }
 function slClearManual(i){
-  var r=SL.rows[i]; r.order_manual=null; r.order_reason='';
+  var r=SL.rows[i]; r.order_manual=null; r.order_reason=''; r.order_ok=null;
   if(r.art && SL.id) api('/api/sales_lesson_del',{snap:SL.id, art:r.art})
     .then(function(res){ if(res&&res.ok) slLessonsCount(res.lessons_count); }).catch(function(){});
 }
@@ -996,7 +1052,7 @@ function slCellText(r,c){
   if(col.k==='name') return slName(r);
   if(col.k==='total') return slFmt(slTotal(r));
   if(col.k==='order') return slFmt(slOrderVal(r));
-  if(col.ty==='status') return r.order_manual!=null?'✎':(slOrder(r).any?'✓':'');
+  if(col.ty==='status') return slStatus(r);
   if(col.ty==='nid') return r.n||'';
   return col.ty==='num'?slFmt(r[col.k]):(r[col.k]||'');
 }
@@ -1104,7 +1160,7 @@ async function slCatUpload(inp){
   }catch(e){ st.textContent='⚠️ Не удалось загрузить справочник'; }
 }
 function slExport(){
-  var rows=[SL_COLS.map(function(c){return c.ty==='status'?'Правка':c.t;}).concat(['Причина правки'])];
+  var rows=[SL_COLS.map(function(c){return c.t;}).concat(['Причина правки'])];
   SL.rows.forEach(function(r){
     if(!r.art && !r.comment) return;
     rows.push(SL_COLS.map(function(c,ci){ return slCellText(r,ci); }).concat([r.order_reason||'']));
