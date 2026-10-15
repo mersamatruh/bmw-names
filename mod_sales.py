@@ -8,10 +8,14 @@
 
 Данные на сервере (ctx["data_dir"]):
   sales.json          — {settings: {period_days, cover_days}, current: id слепка}
-  sales_snapshots/    — слепки таблицы <ГГГГ-ММ-ДД_чч-мм-сс>.json {id, rows}
+  sales_snapshots/    — слепки таблицы <ГГГГ-ММ-ДД_чч-мм-сс>.json
+                        {id, rows, period: {from, to}}
                         (как слепки в «Названиях»: открытый слепок
                         автосохраняется, «Новая партия» начинает новый)
   sales_catalog.json  — {артикул: наименование}
+  sales_lessons.json  — «методичка заказа»: правки «В заказ» с причинами
+                        [{snap, art, name, calc, manual, reason, period,
+                          cover, row, at, updated}] — материал для ИИ
 """
 
 import os
@@ -21,7 +25,7 @@ import datetime
 
 # Колонки, которые хранятся в строке (наименование, «общие продажи»
 # и «в заказ» вычисляются и не хранятся).
-TEXT_FIELDS = ("art", "repl", "comment")
+TEXT_FIELDS = ("art", "repl", "comment", "order_reason")
 NUM_FIELDS = ("profit", "turn_de", "sold_de", "sold_sup", "sold_stock",
               "stock", "ordered", "transit", "year",
               "order_manual")  # «в заказ», исправленное вручную
@@ -60,6 +64,7 @@ def register(ctx):
     request = ctx["request"]
     SALES_PATH = os.path.join(ctx["data_dir"], "sales.json")
     CATALOG_PATH = os.path.join(ctx["data_dir"], "sales_catalog.json")
+    LESSONS_PATH = os.path.join(ctx["data_dir"], "sales_lessons.json")
     SNAP_DIR = os.path.join(ctx["data_dir"], "sales_snapshots")
     os.makedirs(SNAP_DIR, exist_ok=True)
 
@@ -102,7 +107,7 @@ def register(ctx):
             if fn.endswith(".json"):
                 d = load_json(os.path.join(SNAP_DIR, fn), {})
                 rows = d.get("rows") or []
-                out.append({"id": fn[:-5],
+                out.append({"id": fn[:-5], "period": d.get("period") or {},
                             "total": sum(1 for r in rows if r.get("art"))})
         return out
 
@@ -155,6 +160,7 @@ def register(ctx):
         if snap is None:
             data["current"] = None
         rows = (snap or {}).get("rows") or []
+        period = (snap or {}).get("period") or {}
         cat = load_json(CATALOG_PATH, {})
         arts = set()
         for r in rows:
@@ -162,6 +168,8 @@ def register(ctx):
             arts.add(r.get("repl"))
         names = {a: cat[a] for a in arts if a and a in cat}
         return jsonify({"settings": data["settings"], "rows": rows,
+                        "period": period,
+                        "lessons_count": len(load_json(LESSONS_PATH, [])),
                         "id": data["current"], "snapshots": list_snaps(),
                         "names": names, "catalog_size": len(cat)})
 
@@ -176,22 +184,81 @@ def register(ctx):
         for k, dflt in (("period_days", 90), ("cover_days", 60)):
             v = parse_num(st.get(k))
             settings[k] = v if isinstance(v, (int, float)) and v > 0 else dflt
+        per = d.get("period") or {}
+        period = {k: str(per.get(k) or "") for k in ("from", "to")
+                  if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(per.get(k) or ""))}
         sid = d.get("id") or None
         created = False
         with lock:
             data = load_sales()
             data["settings"] = settings
             if sid and snap_path(sid) and os.path.exists(snap_path(sid)):
-                save_json(snap_path(sid), {"id": sid, "rows": rows})
-            elif rows:                    # первая запись новой партии
+                save_json(snap_path(sid), {"id": sid, "rows": rows, "period": period})
+            elif rows or period:          # первая запись новой партии
                 sid, created = new_snap_id(), True
-                save_json(snap_path(sid), {"id": sid, "rows": rows})
+                save_json(snap_path(sid), {"id": sid, "rows": rows, "period": period})
             else:
                 sid = None
             data["current"] = sid
             save_json(SALES_PATH, data)
         return jsonify({"ok": True, "count": len(rows), "id": sid,
                         "created": created})
+
+    # ---------- Методичка заказа (правки «В заказ» с причинами) ----------
+
+    @app.post("/api/sales_lesson")
+    def api_sales_lesson():
+        """Сохранить/обновить правку: ключ — слепок + артикул."""
+        if not check_auth(request):
+            return deny()
+        d = request.get_json(force=True) or {}
+        snap, art = str(d.get("snap") or ""), norm_art(d.get("art"))
+        reason = str(d.get("reason") or "").strip()[:2000]
+        if not snap or not art or not reason:
+            return jsonify({"error": "Нужны слепок, артикул и причина"}), 400
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        rec = {"snap": snap, "art": art, "repl": norm_art(d.get("repl")),
+               "name": str(d.get("name") or "")[:300],
+               "calc": parse_num(d.get("calc")), "manual": parse_num(d.get("manual")),
+               "reason": reason, "period": d.get("period") or {},
+               "cover": parse_num(d.get("cover")),
+               "row": {k: parse_num((d.get("row") or {}).get(k)) for k in NUM_FIELDS
+                       if k != "order_manual"}}
+        with lock:
+            lessons = load_json(LESSONS_PATH, [])
+            for old in lessons:
+                if old.get("snap") == snap and old.get("art") == art:
+                    if old.get("reason") != reason:
+                        old.setdefault("history", []).append(
+                            {"reason": old.get("reason"), "manual": old.get("manual"),
+                             "at": old.get("updated") or old.get("at")})
+                    old.update(rec)
+                    old["updated"] = now
+                    break
+            else:
+                rec["at"] = rec["updated"] = now
+                lessons.append(rec)
+            save_json(LESSONS_PATH, lessons)
+        return jsonify({"ok": True, "lessons_count": len(lessons)})
+
+    @app.post("/api/sales_lesson_del")
+    def api_sales_lesson_del():
+        """Правку отменили (вернули расчёт) — убрать её из методички."""
+        if not check_auth(request):
+            return deny()
+        d = request.get_json(force=True) or {}
+        snap, art = str(d.get("snap") or ""), norm_art(d.get("art"))
+        with lock:
+            lessons = [x for x in load_json(LESSONS_PATH, [])
+                       if not (x.get("snap") == snap and x.get("art") == art)]
+            save_json(LESSONS_PATH, lessons)
+        return jsonify({"ok": True, "lessons_count": len(lessons)})
+
+    @app.get("/api/sales_lessons")
+    def api_sales_lessons():
+        if not check_auth(request):
+            return deny()
+        return jsonify({"lessons": load_json(LESSONS_PATH, [])})
 
     @app.post("/api/sales_snap_delete")
     def api_sales_snap_delete():
@@ -307,8 +374,10 @@ def register(ctx):
     <span id="slCurSnap" class="hint"></span>
   </div>
   <div class="bar">
-    <label class="hint">Период продаж, дней
-      <input id="slPeriod" class="slnum" type="number" min="1"></label>
+    <label class="hint">Период продаж: с
+      <input id="slFrom" class="sldate" type="date"> по
+      <input id="slTo" class="sldate" type="date"></label>
+    <span id="slDays" class="hint"></span>
     <label class="hint">Заказывать с запасом на, дней
       <input id="slCover" class="slnum" type="number" min="1"></label>
     <input id="slSearch" placeholder="Поиск по артикулу или названию">
@@ -321,6 +390,7 @@ def register(ctx):
     <button onclick="slToggleCat()">📚 Справочник <span id="slCatCnt" class="hint"></span></button>
     <label class="hint" title="При вставке из Excel первая строка (название столбца) отбрасывается">
       <input type="checkbox" id="slSkipHead" checked> Убирать заголовок при вставке</label>
+    <span id="slLessons" class="hint" title="Правки «В заказ» с причинами — из них будет учиться ИИ"></span>
     <span id="slSaved" class="hint"></span>
   </div>
   <div id="slCat" class="panel" style="display:none;padding:12px 14px;margin-bottom:12px">
@@ -335,11 +405,28 @@ def register(ctx):
       <span id="slCatMsg" class="hint"></span>
     </div>
   </div>
+  <div id="slDlg" class="sldlg" style="display:none">
+    <div class="box">
+      <div id="slDlgHd" style="font-weight:700;font-size:16px;margin-bottom:4px">Объясни почему?</div>
+      <div id="slDlgSub" class="hint" style="margin-bottom:10px"></div>
+      <label class="hint">Количество в заказ
+        <input id="slDlgQty" class="slnum" style="width:90px"></label>
+      <textarea id="slDlgText" rows="4" placeholder="Причина (обязательно)…"></textarea>
+      <div id="slDlgErr" class="hint" style="color:var(--err);min-height:18px"></div>
+      <div class="bar" style="margin:6px 0 0">
+        <button class="primary" onclick="slDlgOk()">Сохранить (Enter)</button>
+        <button onclick="slDlgCancel()">Отмена (Esc)</button>
+        <button id="slDlgReset" onclick="slDlgReset()" title="Убрать правку и вернуть расчётное количество">Вернуть расчёт</button>
+        <span class="hint">Shift+Enter — новая строка</span>
+      </div>
+    </div>
+  </div>
   <div id="slWrap"><table id="slTable"><thead></thead><tbody></tbody></table></div>
   <p class="hint" style="margin-top:10px">«В заказ» считается формулой: средний
-    дневной спрос (60% — текущий период, 40% — последний год) × дней запаса − наличие
-    − уже заказано. Наведите на число, чтобы увидеть расчёт. Число можно исправить
-    вручную (оно станет жирным); очистите ячейку — вернётся расчёт.</p>
+    дневной спрос (60% — выбранный период, 40% — последние 365 дней) × дней запаса
+    (по умолчанию 60 = 2 месяца) − наличие − уже заказано. Наведите на число, чтобы
+    увидеть расчёт. Если исправить число — спросим причину; правка станет жирной, а в
+    колонке справа появится ✎ (нажмите, чтобы поправить причину). ✓ — расчёт принят.</p>
 """
 
     CSS = """
@@ -362,6 +449,18 @@ def register(ctx):
   #slTable td.order.manual input{font-weight:800;color:#c2410c;text-decoration:underline dotted}
   #slTable th.order{background:#ffd3a3;color:#7a3a00}
   #slTable td.nm{padding:6px 8px;font-size:12px;min-width:180px}
+  #slTable td.st{text-align:center;width:34px;padding:0 4px;font-size:15px}
+  #slTable td.st.ok{color:#15803d}
+  #slTable td.st button{border:none;background:none;padding:2px 4px;font-size:15px;cursor:pointer}
+  #slTable th.status{text-align:center;white-space:nowrap}
+  .sldate{padding:5px 6px;border:1px solid var(--line);border-radius:6px;font:inherit;margin:0 2px}
+  #slDays.warn{color:#c2410c;font-weight:600}
+  .sldlg{position:fixed;inset:0;background:rgba(15,23,42,.35);z-index:50;
+         display:flex;align-items:center;justify-content:center}
+  .sldlg .box{background:var(--panel);border-radius:10px;padding:18px 20px;width:min(520px,92vw);
+              box-shadow:0 10px 40px rgba(0,0,0,.25)}
+  .sldlg textarea{width:100%;box-sizing:border-box;margin-top:10px;padding:8px;font:inherit;
+                  border:1px solid var(--line);border-radius:6px}
   #slTable td.sel{background:#cfe0fb !important;box-shadow:inset 0 0 0 1px #8fb3ef}
   #slTable td.sel input{background:transparent}
   #slTable td.nm.miss{color:var(--mut);font-style:italic}
@@ -389,13 +488,14 @@ var SL_COLS = [
   {k:'sold_stock', t:'Продано за период склад',     ty:'num'},
   {k:'total',      t:'Общие продажи',               ty:'calc'},
   {k:'order',      t:'В заказ',                     ty:'order'},
+  {k:'status',     t:'✓ / ✎',                       ty:'status'},
   {k:'comment',    t:'Комментарий',                 ty:'text'},
   {k:'stock',      t:'Наше наличие',                ty:'num'},
   {k:'ordered',    t:'Кол-во заказано',             ty:'num'},
   {k:'transit',    t:'В пути',                      ty:'num'},
   {k:'year',       t:'Продажи за год (365 дн.)',    ty:'num'}
 ];
-var SL = {rows:[], names:{}, settings:{period_days:90, cover_days:60}, loaded:false, id:null,
+var SL = {rows:[], names:{}, settings:{period_days:90, cover_days:60}, loaded:false, id:null, period:{},
           saveTimer:null, filter:''};
 var SL_CYR = {'А':'A','В':'B','Е':'E','К':'K','М':'M','Н':'H','О':'O','Р':'P','С':'C',
               'Т':'T','Х':'X','У':'Y'};
@@ -422,14 +522,24 @@ function slTotal(r){
   return (a||0)+(b||0)+(c||0);
 }
 /* пробная формула «в заказ» */
+function slPeriodDays(){
+  var f=SL.period.from, t=SL.period.to;
+  if(f && t){ var d=Math.round((Date.parse(t)-Date.parse(f))/864e5)+1; if(d>0) return d; }
+  return null;
+}
+function slShowDays(){
+  var el=document.getElementById('slDays'), d=slPeriodDays();
+  el.textContent=d?('= '+d+' дн.'):('период не указан, считаю как '+(SL.settings.period_days||90)+' дн.');
+  el.classList.toggle('warn', !d);
+}
 function slOrder(r){
-  var P=SL.settings.period_days||90, C=SL.settings.cover_days||60;
+  var P=slPeriodDays()||SL.settings.period_days||90, C=SL.settings.cover_days||60;
   var tot=slTotal(r)||0, yr=r.year||0;
   var rp=tot/P, ry=yr/365, rate;
   if(tot>0&&yr>0) rate=0.6*rp+0.4*ry; else rate=Math.max(rp,ry);
   var need=rate*C, have=(r.stock||0)+(r.ordered||0);
   var q=Math.max(0, Math.ceil(need-have-1e-9));
-  var why='Спрос в день: '+slFmt(rp)+' (период) / '+slFmt(ry)+' (год) → '+slFmt(rate)
+  var why='Спрос в день: '+slFmt(rp)+' (период '+P+' дн.) / '+slFmt(ry)+' (год) → '+slFmt(rate)
     +'\nНужно на '+C+' дн.: '+slFmt(need)
     +'\nЕсть: наличие '+(r.stock||0)+' + заказано '+(r.ordered||0)+' = '+have
     +'\nВ заказ: '+q;
@@ -446,7 +556,8 @@ function slName(r){
 function slSnapList(list){
   var s=document.getElementById('slSnaps');
   s.innerHTML='<option value="">— слепки —</option>'+(list||[]).map(function(x){
-    return '<option value="'+slEsc(x.id)+'">'+slEsc(x.id)+' · '+x.total+' поз.</option>';}).join('');
+    var per=(x.period&&x.period.from&&x.period.to)?(' · '+x.period.from.split('-').reverse().join('.')+'–'+x.period.to.split('-').reverse().join('.')):'';
+    return '<option value="'+slEsc(x.id)+'">'+slEsc(x.id)+per+' · '+x.total+' поз.</option>';}).join('');
   if(SL.id) s.value=SL.id;
   document.getElementById('slCurSnap').textContent=SL.id?('Открыт слепок '+SL.id):'Новая партия (слепок создастся при первом сохранении)';
 }
@@ -454,7 +565,10 @@ async function slFetch(q){
   var d=await apiGet('/api/sales'+(q||''));
   if(d.error){ alert(d.error); return false; }
   SL.rows=d.rows||[]; SL.names=d.names||{}; SL.settings=d.settings||SL.settings;
-  SL.id=d.id||null; slSnapList(d.snapshots);
+  SL.id=d.id||null; SL.period=d.period||{}; slSnapList(d.snapshots);
+  document.getElementById('slFrom').value=SL.period.from||'';
+  document.getElementById('slTo').value=SL.period.to||'';
+  slShowDays(); slLessonsCount(d.lessons_count);
   if(!SL.rows.length) for(var i=0;i<5;i++) SL.rows.push({});
   return d;
 }
@@ -484,12 +598,14 @@ async function slLoad(){
   try{
     var d=await slFetch(); if(!d) return;
     SL.loaded=true;
-    document.getElementById('slPeriod').value=SL.settings.period_days;
     document.getElementById('slCover').value=SL.settings.cover_days;
     slCatCount(d.catalog_size);
     slRender();
   }catch(e){ document.getElementById('slSaved').textContent='Не удалось загрузить таблицу.'; }
 }
+function slLessonsCount(n){
+  var w=(n%10===1&&n%100!==11)?'правка':((n%10>=2&&n%10<=4&&(n%100<10||n%100>=20))?'правки':'правок');
+  document.getElementById('slLessons').textContent=n?('📘 Методичка: '+n+' '+w):''; }
 function slCatCount(n){ document.getElementById('slCatCnt').textContent=n?'('+n+')':''; }
 
 function slVisible(i){
@@ -520,6 +636,11 @@ function slCellHtml(r,i,c,ci){
     return '<td class="nm miss">'+(r.art?'нет в справочнике':'')+'</td>';
   }
   if(c.k==='total') return '<td class="calc">'+slFmt(slTotal(r))+'</td>';
+  if(c.ty==='status'){
+    if(r.order_manual!=null) return '<td class="st" title="'+slEsc('Ваша причина: '+(r.order_reason||'—')+'\nНажмите, чтобы изменить')
+      +'"><button onclick="slEditReason('+i+')">✎</button></td>';
+    return slOrder(r).any?'<td class="st ok" title="Расчёт принят без правок">✓</td>':'<td class="st"></td>';
+  }
   if(c.k==='order'){
     var o=slOrder(r), man=r.order_manual!=null;
     var tip=man?('Исправлено вручную. Расчёт: '+(o.any?o.q:'—')+'\nОчистите ячейку, чтобы вернуть расчёт.\n\n'+o.why):o.why;
@@ -534,7 +655,7 @@ function slRefreshRow(i){
   var r=SL.rows[i];
   SL_COLS.forEach(function(c,ci){
     if(c.ty==='order' && document.activeElement && tr.children[ci].contains(document.activeElement)) return;
-    if(c.ty==='name'||c.ty==='calc'||c.ty==='order'){
+    if(c.ty==='name'||c.ty==='calc'||c.ty==='order'||c.ty==='status'){
       var tmp=document.createElement('tbody');
       tmp.innerHTML='<tr>'+slCellHtml(r,i,c,ci)+'</tr>';
       tr.replaceChild(tmp.firstChild.firstChild, tr.children[ci]);
@@ -546,7 +667,11 @@ function slRefreshCalc(){ SL.rows.forEach(function(r,i){ slRefreshRow(i); }); }
 function slSetCell(i,ci,raw){
   var c=SL_COLS[ci], r=SL.rows[i];
   if(!c||c.ty==='name'||c.ty==='calc') return false;
-  if(c.ty==='order'){ r.order_manual=slNum(raw); return false; }
+  if(c.ty==='status') return false;
+  if(c.ty==='order'){                       // массово — только очистка (правка требует причину)
+    if(slNum(raw)==null && r.order_manual!=null) slClearManual(i);
+    return false;
+  }
   if(c.ty==='art') r[c.k]=slArt(raw);
   else if(c.ty==='num') r[c.k]=slNum(raw);
   else r[c.k]=(raw||'').trim();
@@ -564,7 +689,7 @@ async function slSaveNow(){
   try{
     var rows=SL.rows.filter(function(r){
       return Object.keys(r).some(function(k){return r[k]!=null&&r[k]!=='';}); });
-    var d=await api('/api/sales_save',{id:SL.id, rows:rows, settings:SL.settings});
+    var d=await api('/api/sales_save',{id:SL.id, rows:rows, settings:SL.settings, period:SL.period});
     if(d.ok){
       SL.id=d.id||null;
       if(d.created){ var l=await apiGet('/api/sales?id='+encodeURIComponent(SL.id)); slSnapList(l.snapshots); }
@@ -582,9 +707,9 @@ function slSave(){
 document.addEventListener('change', async function(e){
   var el=e.target; if(!el.closest||!el.closest('#slTable')||el.dataset.c==null) return;
   var i=+el.dataset.i, ci=+el.dataset.c;
+  if(SL_COLS[ci].ty==='order'){ slOrderEdited(i, el); return; }
   var isArt=slSetCell(i,ci,el.value);
   var c=SL_COLS[ci], v=SL.rows[i][c.k];
-  if(c.ty==='order'){ el.blur(); slRefreshRow(i); slSave(); return; }
   el.value=(c.ty==='num')?slFmt(v):(v||'');
   if(isArt) await slLookup([SL.rows[i].art, SL.rows[i].repl]);
   slRefreshRow(i); slSave();
@@ -609,6 +734,65 @@ document.addEventListener('paste', async function(e){
     if(tr) await slPasteAt(+tr.dataset.i, b.c1, txt);
   }
 });
+/* ---------- правка «В заказ» с причиной ---------- */
+function slOrderEdited(i, el){
+  var r=SL.rows[i], v=slNum(el.value), o=slOrder(r);
+  el.blur();
+  if(v==null){ if(r.order_manual!=null){ slClearManual(i); slSave(); } slRefreshRow(i); return; }
+  if(r.order_manual==null && o.any && v===o.q){ slRefreshRow(i); return; }      // совпало с расчётом
+  if(r.order_manual!=null && v===r.order_manual){ slRefreshRow(i); return; }    // не изменилось
+  if(!r.art){ alert('Сначала укажите артикул в этой строке.'); slRefreshRow(i); return; }
+  slAsk(i, v);
+}
+function slAsk(i, qty){
+  var r=SL.rows[i], o=slOrder(r);
+  SL.dlg={i:i};
+  document.getElementById('slDlgHd').textContent=r.order_manual!=null?'Изменить причину':'Объясни почему?';
+  document.getElementById('slDlgSub').textContent=(r.art||'')+(slName(r)?' · '+slName(r):'')
+    +' — расчёт: '+(o.any?o.q:'—')+' шт.';
+  document.getElementById('slDlgQty').value=slFmt(qty);
+  document.getElementById('slDlgText').value=r.order_reason||'';
+  document.getElementById('slDlgErr').textContent='';
+  document.getElementById('slDlgReset').style.display=r.order_manual!=null?'':'none';
+  document.getElementById('slDlg').style.display='flex';
+  setTimeout(function(){ document.getElementById('slDlgText').focus(); },30);
+}
+function slEditReason(i){ slAsk(i, SL.rows[i].order_manual); }
+function slDlgClose(){ document.getElementById('slDlg').style.display='none'; var d=SL.dlg; SL.dlg=null; if(d) slRefreshRow(d.i); }
+function slDlgCancel(){ slDlgClose(); }
+function slDlgReset(){ var d=SL.dlg; if(!d) return; slClearManual(d.i); slDlgClose(); slSave(); }
+async function slDlgOk(){
+  var d=SL.dlg; if(!d) return;
+  var reason=document.getElementById('slDlgText').value.trim(),
+      qty=slNum(document.getElementById('slDlgQty').value), err=document.getElementById('slDlgErr');
+  if(qty==null){ err.textContent='Укажите количество.'; return; }
+  if(!reason){ err.textContent='Причина обязательна — напишите, почему именно столько.'; return; }
+  var r=SL.rows[d.i], o=slOrder(r);
+  r.order_manual=qty; r.order_reason=reason;
+  slDlgClose();
+  clearTimeout(SL.saveTimer); SL.saveTimer=null; await slSaveNow();   // нужен id слепка
+  try{
+    var row={}; ['profit','turn_de','sold_de','sold_sup','sold_stock','stock','ordered','transit','year']
+      .forEach(function(k){ row[k]=r[k]; });
+    var p=SL.period; var res=await api('/api/sales_lesson',{snap:SL.id, art:r.art, repl:r.repl, name:slName(r),
+      calc:o.any?o.q:null, manual:qty, reason:reason, cover:SL.settings.cover_days,
+      period:{from:p.from||'', to:p.to||'', days:slPeriodDays()}, row:row});
+    if(res.ok) slLessonsCount(res.lessons_count);
+  }catch(e){}
+}
+function slClearManual(i){
+  var r=SL.rows[i]; r.order_manual=null; r.order_reason='';
+  if(r.art && SL.id) api('/api/sales_lesson_del',{snap:SL.id, art:r.art})
+    .then(function(res){ if(res&&res.ok) slLessonsCount(res.lessons_count); }).catch(function(){});
+}
+document.addEventListener('keydown', function(e){
+  if(!SL.dlg) return;
+  if(e.key==='Escape'){ e.preventDefault(); slDlgCancel(); }
+  else if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); slDlgOk(); }
+}, true);
+
+/* колонки, по которым раскладывается вставка из Excel (без служебной ✓/✎) */
+var SL_PASTE=SL_COLS.map(function(c,ci){return ci;}).filter(function(ci){return SL_COLS[ci].ty!=='status';});
 async function slPasteAt(i0, c0, txt){
   var lines=txt.replace(/\r/g,'').split('\n');
   if(lines.length && lines[lines.length-1]==='') lines.pop();
@@ -617,10 +801,12 @@ async function slPasteAt(i0, c0, txt){
   var arts=[];
   lines.forEach(function(line,li){
     var i=i0+li; while(SL.rows.length<=i) SL.rows.push({});
-    var cells=line.split('\t');
+    var cells=line.split('\t'), p0=SL_PASTE.indexOf(c0);
+    if(p0<0) p0=SL_PASTE.indexOf(c0+1);
     cells.forEach(function(val,vi){
-      if(cells.length>1 && SL_COLS[c0+vi] && SL_COLS[c0+vi].ty==='order') return;
-      slSetCell(i,c0+vi,val); });
+      var ci=SL_PASTE[p0+vi];
+      if(ci==null || SL_COLS[ci].ty==='order') return;   // «В заказ» правится только с причиной
+      slSetCell(i,ci,val); });
     arts.push(SL.rows[i].art, SL.rows[i].repl);
   });
   await slLookup(arts);
@@ -679,10 +865,11 @@ function slCellText(r,c){
   if(col.k==='name') return slName(r);
   if(col.k==='total') return slFmt(slTotal(r));
   if(col.k==='order') return slFmt(slOrderVal(r));
+  if(col.ty==='status') return r.order_manual!=null?'✎':(slOrder(r).any?'✓':'');
   return col.ty==='num'?slFmt(r[col.k]):(r[col.k]||'');
 }
 document.addEventListener('copy', function(e){
-  if(!SL.sel || !slSecVisible()) return;
+  if(!SL.sel || SL.dlg || !slSecVisible()) return;
   var ae=document.activeElement;
   if(!slSelMulti() && ae && ae.tagName==='INPUT') return;   // обычная копия текста в ячейке
   var b=slSelBox(), trs=document.querySelectorAll('#slTable tbody tr'), out=[];
@@ -693,7 +880,7 @@ document.addEventListener('copy', function(e){
   document.getElementById('slSaved').textContent='Скопировано ячеек: '+((b.r2-b.r1+1)*(b.c2-b.c1+1));
 });
 document.addEventListener('keydown', function(e){
-  if(!SL.sel || !slSecVisible()) return;
+  if(!SL.sel || SL.dlg || !slSecVisible()) return;
   var ae=document.activeElement, inInput=ae && ae.tagName==='INPUT';
   if(e.key==='Escape'){ slSelClear(); return; }
   if((e.key==='Delete'||e.key==='Backspace') && (slSelMulti() || !inInput)){
@@ -761,15 +948,10 @@ async function slCatUpload(inp){
   }catch(e){ st.textContent='⚠️ Не удалось загрузить справочник'; }
 }
 function slExport(){
-  var rows=[SL_COLS.map(function(c){return c.t;})];
+  var rows=[SL_COLS.map(function(c){return c.ty==='status'?'Правка':c.t;}).concat(['Причина правки'])];
   SL.rows.forEach(function(r){
     if(!r.art && !r.comment) return;
-    rows.push(SL_COLS.map(function(c){
-      if(c.k==='name') return slName(r);
-      if(c.k==='total') return slFmt(slTotal(r));
-      if(c.k==='order') return slFmt(slOrderVal(r));
-      return c.ty==='num'?slFmt(r[c.k]):(r[c.k]||'');
-    }));
+    rows.push(SL_COLS.map(function(c,ci){ return slCellText(r,ci); }).concat([r.order_reason||'']));
   });
   var csv=rows.map(function(row){return row.map(function(v){
     v=(v==null?'':v+''); return /[;"\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;}).join(';');}).join('\r\n');
@@ -777,12 +959,18 @@ function slExport(){
   a.href=URL.createObjectURL(new Blob(['﻿'+csv],{type:'text/csv;charset=utf-8'}));
   a.download='analiz_prodazh.csv'; a.click();
 }
-['slPeriod','slCover'].forEach(function(id){
+(function(){ var el=document.getElementById('slCover'); if(!el) return;
+  el.addEventListener('change', function(){
+    var v=slNum(el.value); if(!(v>0)){ el.value=SL.settings.cover_days; return; }
+    SL.settings.cover_days=v; slRefreshCalc(); slSave();
+  }); })();
+['slFrom','slTo'].forEach(function(id){
   var el=document.getElementById(id); if(!el) return;
   el.addEventListener('change', function(){
-    var v=slNum(el.value); if(!(v>0)){ el.value=id==='slPeriod'?SL.settings.period_days:SL.settings.cover_days; return; }
-    if(id==='slPeriod') SL.settings.period_days=v; else SL.settings.cover_days=v;
-    slRefreshCalc(); slSave();
+    SL.period[id==='slFrom'?'from':'to']=el.value||'';
+    if(SL.period.from && SL.period.to && SL.period.from>SL.period.to){
+      alert('Дата «с» позже даты «по» — проверьте период.'); }
+    slShowDays(); slRefreshCalc(); slSave();
   });
 });
 (function(){ var s=document.getElementById('slSearch'); if(!s) return;
