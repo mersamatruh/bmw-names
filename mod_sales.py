@@ -136,25 +136,15 @@ def register(ctx):
         arts = [norm_art(a) for a in (d.get("arts") or [])][:5000]
         return jsonify({"names": names_for(arts)})
 
-    @app.post("/api/sales_catalog_add")
-    def api_sales_catalog_add():
-        """Принимает текст «артикул<TAB>наименование» построчно (из Excel/CSV)."""
-        if not check_auth(request):
-            return deny()
-        d = request.get_json(force=True) or {}
-        text = str(d.get("text") or "")
+    def catalog_merge(pairs):
+        """Добавляет пары (артикул, наименование) в справочник."""
         added = updated = skipped = 0
         with lock:
             cat = load_json(CATALOG_PATH, {})
-            for line in text.splitlines():
-                if not line.strip():
-                    continue
-                parts = re.split(r"\t|;", line, maxsplit=1)
-                if len(parts) < 2:
-                    skipped += 1
-                    continue
-                art, name = norm_art(parts[0]), parts[1].strip().strip('"').strip()
-                if not art or not name:
+            for art, name in pairs:
+                art = norm_art(art)
+                name = str(name or "").strip().strip('"').strip()
+                if not art or not name or name.lower() == "nan":
                     skipped += 1
                     continue
                 if art in cat:
@@ -164,8 +154,61 @@ def register(ctx):
                     added += 1
                 cat[art] = name
             save_json(CATALOG_PATH, cat)
-        return jsonify({"ok": True, "added": added, "updated": updated,
-                        "skipped": skipped, "catalog_size": len(cat)})
+        return {"ok": True, "added": added, "updated": updated,
+                "skipped": skipped, "catalog_size": len(cat)}
+
+    @app.post("/api/sales_catalog_upload")
+    def api_sales_catalog_upload():
+        """Файл Excel (xlsx/xls) или CSV: столбцы «артикул», «наименование»."""
+        if not check_auth(request):
+            return deny()
+        f = request.files.get("file")
+        if f is None:
+            return jsonify({"error": "Файл не получен"}), 400
+        import io
+        import pandas as pd
+        fn = (f.filename or "").lower()
+        try:
+            data = f.read()
+            if fn.endswith((".csv", ".txt", ".tsv")):
+                df = pd.read_csv(io.BytesIO(data), sep=None, engine="python",
+                                 dtype=str, header=None, encoding="utf-8-sig")
+            else:
+                df = pd.read_excel(io.BytesIO(data), dtype=str, header=None)
+        except Exception as e:
+            return jsonify({"error": f"Не удалось прочитать файл: {e}"}), 400
+        cols = [c for c in df.columns if df[c].notna().any()]
+        if len(cols) < 2:
+            return jsonify({"error": "В файле нужны два столбца: артикул и наименование"}), 400
+        df = df[cols[:2]].fillna("")
+        rows = df.values.tolist()
+        # первая строка — заголовок («Артикул», «Наименование»)? пропускаем
+        if rows:
+            h0, h1 = str(rows[0][0]).lower(), str(rows[0][1]).lower()
+            if any(w in h0 for w in ("артикул", "article", "номер", "part")) or \
+               any(w in h1 for w in ("наимен", "назван", "name")):
+                rows = rows[1:]
+        return jsonify(catalog_merge(rows))
+
+    @app.post("/api/sales_catalog_add")
+    def api_sales_catalog_add():
+        """Принимает текст «артикул<TAB>наименование» построчно (из Excel/CSV)."""
+        if not check_auth(request):
+            return deny()
+        d = request.get_json(force=True) or {}
+        text = str(d.get("text") or "")
+        pairs, bad = [], 0
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            parts = re.split(r"\t|;", line, maxsplit=1)
+            if len(parts) < 2:
+                bad += 1
+                continue
+            pairs.append(parts)
+        res = catalog_merge(pairs)
+        res["skipped"] += bad
+        return jsonify(res)
 
     # ---------- Что отдаём ядру для оболочки ----------
 
@@ -182,6 +225,10 @@ def register(ctx):
     <input id="slSearch" placeholder="Поиск по артикулу или названию">
     <button onclick="slAddRow()">+ Строка</button>
     <button onclick="slExport()">⬇️ Скачать CSV</button>
+    <button onclick="document.getElementById('slCatXls').click()"
+            title="Excel-файл: столбец A — артикул, столбец B — наименование">📥 Загрузить справочник (Excel)</button>
+    <input type="file" id="slCatXls" accept=".xlsx,.xls,.csv" style="display:none"
+           onchange="slCatUpload(this)">
     <button onclick="slToggleCat()">📚 Справочник <span id="slCatCnt" class="hint"></span></button>
     <span id="slSaved" class="hint"></span>
   </div>
@@ -456,6 +503,22 @@ async function slCatAdd(){
     SL.names={}; await slLookup([].concat.apply([],SL.rows.map(function(r){return [r.art,r.repl];})));
     slRender();
   }catch(e){ msg.textContent='Не удалось загрузить.'; }
+}
+async function slCatUpload(inp){
+  var f=inp.files&&inp.files[0]; if(!f) return; inp.value='';
+  var st=document.getElementById('slSaved'); st.textContent='Загружаю справочник…';
+  try{
+    var fd=new FormData(); fd.append('file',f);
+    var res=await fetch('/api/sales_catalog_upload',{method:'POST',headers:{'X-Auth':AUTH},body:fd});
+    if(res.status===401){ st.textContent='Нужен пароль'; return; }
+    var d=await res.json();
+    if(d.error){ st.textContent=''; alert('Ошибка: '+d.error); return; }
+    slCatCount(d.catalog_size); st.textContent='';
+    alert('Справочник загружен: добавлено '+d.added+', обновлено '+d.updated
+      +(d.skipped?', пропущено пустых '+d.skipped:'')+'. Всего позиций: '+d.catalog_size+'.');
+    SL.names={}; await slLookup([].concat.apply([],SL.rows.map(function(r){return [r.art,r.repl];})));
+    slRender();
+  }catch(e){ st.textContent='⚠️ Не удалось загрузить справочник'; }
 }
 function slCatFile(inp){
   var f=inp.files&&inp.files[0]; if(!f) return;
