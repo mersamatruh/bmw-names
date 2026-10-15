@@ -133,6 +133,7 @@ def register(ctx):
             out[k] = norm_art(v) if k in ("art", "repl") else v[:1000]
         for k in NUM_FIELDS:
             out[k] = parse_num(r.get(k))
+        out["n"] = parse_num(r.get("n"))   # постоянный № строки (порядок вставки)
         return out
 
     def names_for(arts):
@@ -382,6 +383,7 @@ def register(ctx):
       <input id="slCover" class="slnum" type="number" min="1"></label>
     <input id="slSearch" placeholder="Поиск по артикулу или названию">
     <button onclick="slAddRow()">+ Строка</button>
+    <button onclick="slResetOrder()" title="Снять фильтры и сортировку, выстроить строки по № от 1">↺ Вернуть исходный порядок</button>
     <button onclick="slExport()">⬇️ Скачать CSV</button>
     <button onclick="document.getElementById('slCatXls').click()"
             title="Excel-файл: столбец A — артикул, столбец B — наименование">📥 Загрузить справочник (Excel)</button>
@@ -434,8 +436,18 @@ def register(ctx):
   #slWrap{overflow:auto;max-height:calc(100vh - 230px);border:1px solid var(--line);
           border-radius:8px}
   #slTable{border:none;border-radius:0;min-width:1500px}
-  #slTable th{position:sticky;top:0;background:var(--panel);z-index:1;
-              white-space:normal;vertical-align:bottom;font-size:11px;line-height:1.25}
+  #slTable thead{position:sticky;top:0;z-index:2}
+  #slTable th{background:var(--panel);white-space:normal;vertical-align:bottom;
+              font-size:11px;line-height:1.25}
+  #slTable th.srt{cursor:pointer}
+  #slTable th.srt:hover{color:var(--blue)}
+  #slTable th .ar{color:var(--blue);font-size:12px}
+  #slTable tr.flt th{padding:3px 4px;background:#f7f9fb;border-bottom:2px solid var(--line)}
+  #slTable tr.flt input,#slTable tr.flt select{width:100%;box-sizing:border-box;padding:3px 5px;
+        border:1px solid var(--line);border-radius:4px;font:12px/1.3 inherit;background:#fff;min-width:40px}
+  #slTable tr.flt input.on,#slTable tr.flt select.on{border-color:var(--blue);background:#eef4fe}
+  #slTable td.nid{text-align:right;padding:6px 6px;color:var(--mut);font-size:12px;
+                  background:#f7f9fb;width:34px}
   #slTable td{padding:0;border-right:1px solid var(--line);vertical-align:middle}
   #slTable td input{width:100%;border:none;background:transparent;padding:6px 7px;
                     font:inherit;font-size:13px;box-sizing:border-box}
@@ -478,6 +490,7 @@ def register(ctx):
     JS = r"""
 /* колонки таблицы: k — ключ, t — заголовок, ty — тип */
 var SL_COLS = [
+  {k:'n',          t:'№',                           ty:'nid'},
   {k:'art',        t:'Артикул',                     ty:'art'},
   {k:'repl',       t:'Артикул замены',              ty:'art'},
   {k:'name',       t:'Наименование (справочник)',   ty:'name'},
@@ -495,7 +508,7 @@ var SL_COLS = [
   {k:'transit',    t:'В пути',                      ty:'num'},
   {k:'year',       t:'Продажи за год (365 дн.)',    ty:'num'}
 ];
-var SL = {rows:[], names:{}, settings:{period_days:90, cover_days:60}, loaded:false, id:null, period:{},
+var SL = {colf:{}, sort:null, rows:[], names:{}, settings:{period_days:90, cover_days:60}, loaded:false, id:null, period:{},
           saveTimer:null, filter:''};
 var SL_CYR = {'А':'A','В':'B','Е':'E','К':'K','М':'M','Н':'H','О':'O','Р':'P','С':'C',
               'Т':'T','Х':'X','У':'Y'};
@@ -608,17 +621,90 @@ function slLessonsCount(n){
   document.getElementById('slLessons').textContent=n?('📘 Методичка: '+n+' '+w):''; }
 function slCatCount(n){ document.getElementById('slCatCnt').textContent=n?'('+n+')':''; }
 
+function slColMatch(r, ci, f){
+  var t=(slCellText(r,ci)+'').trim(), m;
+  if(f==='пусто') return t==='';
+  if(f==='не пусто') return t!=='';
+  if((m=f.match(/^(>=|<=|>|<|=)\s*(-?[\d\s.,]+)$/))){
+    var v=slNum(t), x=slNum(m[2]); if(v==null||x==null) return false;
+    return m[1]==='>'?v>x:m[1]==='<'?v<x:m[1]==='>='?v>=x:m[1]==='<='?v<=x:v===x;
+  }
+  return t.toUpperCase().indexOf(f.toUpperCase())>=0;
+}
 function slVisible(i){
+  var r=SL.rows[i];
+  for(var k in SL.colf){ var f=SL.colf[k]; if(!f) continue;
+    var ci=SL_COLS.findIndex(function(c){return c.k===k;});
+    if(ci>=0 && !slColMatch(r,ci,f)) return false; }
   if(!SL.filter) return true;
-  var r=SL.rows[i], f=SL.filter;
+  var f=SL.filter;
   if(((r.art||'')+' '+(r.repl||'')+' '+slName(r)).toUpperCase().indexOf(f)>=0) return true;
   var fa=/[А-ЯЁ]/.test(f)?'':slArt(f);
   return !!fa && ((r.art||'')+' '+(r.repl||'')).indexOf(fa)>=0;
 }
+function slEnsureN(){
+  var mx=0; SL.rows.forEach(function(r){ if(r.n>mx) mx=r.n; });
+  SL.rows.forEach(function(r){ if(!(r.n>0)) r.n=++mx; });
+}
+function slHead(){
+  var t=document.getElementById('slTable');
+  if(!t.tHead.rows.length){
+    var h='<tr class="ttl">'; SL_COLS.forEach(function(c){
+      h+='<th class="'+c.ty+' srt" data-k="'+c.k+'" title="Нажмите для сортировки">'+c.t+' <span class="ar"></span></th>';});
+    h+='<th></th></tr><tr class="flt">';
+    SL_COLS.forEach(function(c){
+      if(c.ty==='status') h+='<th><select data-f="status"><option value="">все</option><option>✓</option><option>✎</option></select></th>';
+      else h+='<th><input data-f="'+c.k+'" placeholder="🔍" title="'+(c.ty==='num'||c.ty==='calc'||c.ty==='order'||c.ty==='nid'
+        ?'Число: &gt;5, &lt;3, &gt;=10, =0; или «пусто» / «не пусто»':'Текст содержит…; или «пусто» / «не пусто»')+'"></th>';
+    });
+    h+='<th></th></tr>';
+    t.tHead.innerHTML=h;
+  }
+  t.tHead.querySelectorAll('tr.ttl th[data-k]').forEach(function(th){
+    var k=th.dataset.k, ar=th.querySelector('.ar');
+    ar.textContent=(SL.sort&&SL.sort.k===k)?(SL.sort.dir>0?'▲':'▼'):''; });
+  t.tHead.querySelectorAll('tr.flt [data-f]').forEach(function(el){
+    var v=SL.colf[el.dataset.f]||''; if(el.value!==v) el.value=v; el.classList.toggle('on', !!v); });
+}
+function slSortBy(k){
+  var ci=SL_COLS.findIndex(function(c){return c.k===k;}); if(ci<0) return;
+  var dir=(SL.sort&&SL.sort.k===k)?-SL.sort.dir:1;
+  SL.sort={k:k, dir:dir};
+  var num=['nid','num','calc','order'].indexOf(SL_COLS[ci].ty)>=0;
+  SL.rows.sort(function(a,b){
+    var x=slCellText(a,ci), y=slCellText(b,ci);
+    if(num){ x=slNum(x); y=slNum(y); }
+    var ex=(x==null||x===''), ey=(y==null||y==='');
+    if(ex&&ey) return (a.n||0)-(b.n||0); if(ex) return 1; if(ey) return -1;   // пустые — вниз
+    var r=num?(x-y):(x+'').localeCompare(y+'','ru');
+    return r? r*dir : (a.n||0)-(b.n||0);
+  });
+  slSelClear(); slRender(); slSave();
+}
+function slResetOrder(){
+  SL.colf={}; SL.sort=null; SL.filter='';
+  var s=document.getElementById('slSearch'); if(s) s.value='';
+  // пустые строки — в конец, остальные по №, затем № заново от 1
+  SL.rows.sort(function(a,b){ return (a.n||1e9)-(b.n||1e9); });
+  SL.rows.forEach(function(r,i){ r.n=i+1; });
+  slSelClear(); slRender(); slSave();
+}
+document.addEventListener('click', function(e){
+  var th=e.target.closest && e.target.closest('#slTable tr.ttl th[data-k]');
+  if(th) slSortBy(th.dataset.k);
+});
+document.addEventListener('input', function(e){
+  var el=e.target; if(!el.closest || !el.closest('#slTable tr.flt') || !el.dataset.f) return;
+  SL.colf[el.dataset.f]=el.value.trim(); el.classList.toggle('on', !!el.value.trim());
+  slSelClear(); slRender();
+});
+document.addEventListener('change', function(e){
+  var el=e.target; if(!el.closest || !el.closest('#slTable tr.flt') || el.tagName!=='SELECT') return;
+  SL.colf[el.dataset.f]=el.value; slSelClear(); slRender();
+});
 function slRender(){
   var t=document.getElementById('slTable');
-  var h='<tr>'; SL_COLS.forEach(function(c){h+='<th class="'+c.ty+'">'+c.t+'</th>';}); h+='<th></th></tr>';
-  t.tHead.innerHTML=h;
+  slEnsureN(); slHead();
   var b='';
   SL.rows.forEach(function(r,i){ if(slVisible(i)) b+=slRowHtml(r,i); });
   t.tBodies[0].innerHTML=b;
@@ -630,6 +716,7 @@ function slRowHtml(r,i){
   return h+'<td class="del"><button title="Удалить строку" onclick="slDelRow('+i+')">✕</button></td></tr>';
 }
 function slCellHtml(r,i,c,ci){
+  if(c.ty==='nid') return '<td class="nid">'+(r.n||'')+'</td>';
   if(c.ty==='name'){
     var n=slName(r);
     if(n) return '<td class="nm">'+slEsc(n)+'</td>';
@@ -667,7 +754,7 @@ function slRefreshCalc(){ SL.rows.forEach(function(r,i){ slRefreshRow(i); }); }
 function slSetCell(i,ci,raw){
   var c=SL_COLS[ci], r=SL.rows[i];
   if(!c||c.ty==='name'||c.ty==='calc') return false;
-  if(c.ty==='status') return false;
+  if(c.ty==='status'||c.ty==='nid') return false;
   if(c.ty==='order'){                       // массово — только очистка (правка требует причину)
     if(slNum(raw)==null && r.order_manual!=null) slClearManual(i);
     return false;
@@ -688,7 +775,7 @@ async function slLookup(arts){
 async function slSaveNow(){
   try{
     var rows=SL.rows.filter(function(r){
-      return Object.keys(r).some(function(k){return r[k]!=null&&r[k]!=='';}); });
+      return Object.keys(r).some(function(k){return k!=='n'&&r[k]!=null&&r[k]!=='';}); });
     var d=await api('/api/sales_save',{id:SL.id, rows:rows, settings:SL.settings, period:SL.period});
     if(d.ok){
       SL.id=d.id||null;
@@ -728,7 +815,7 @@ document.addEventListener('paste', async function(e){
   if(el.closest && el.closest('#slTable') && el.dataset.c!=null){
     if(txt.indexOf('\t')<0 && txt.indexOf('\n')<0) return;
     e.preventDefault(); slSelClear(); await slPasteAt(+el.dataset.i, +el.dataset.c, txt);
-  } else if(SL.sel && slSecVisible()){
+  } else if(SL.sel && slSecVisible() && !slInHead()){
     e.preventDefault();
     var b=slSelBox(), tr=document.querySelectorAll('#slTable tbody tr')[b.r1];
     if(tr) await slPasteAt(+tr.dataset.i, b.c1, txt);
@@ -792,7 +879,7 @@ document.addEventListener('keydown', function(e){
 }, true);
 
 /* колонки, по которым раскладывается вставка из Excel (без служебной ✓/✎) */
-var SL_PASTE=SL_COLS.map(function(c,ci){return ci;}).filter(function(ci){return SL_COLS[ci].ty!=='status';});
+var SL_PASTE=SL_COLS.map(function(c,ci){return ci;}).filter(function(ci){return SL_COLS[ci].ty!=='status'&&SL_COLS[ci].ty!=='nid';});
 async function slPasteAt(i0, c0, txt){
   var lines=txt.replace(/\r/g,'').split('\n');
   if(lines.length && lines[lines.length-1]==='') lines.pop();
@@ -820,6 +907,7 @@ async function slPasteAt(i0, c0, txt){
    протянуть мышкой или Shift+клик; Ctrl+C — копия, Delete — очистка,
    Ctrl+V — вставка с левого верхнего угла; Esc — снять выделение */
 SL.sel=null; SL.drag=null;
+function slInHead(){ var a=document.activeElement; return !!(a&&a.closest&&a.closest('#slTable thead')); }
 function slSecVisible(){ var s=document.getElementById('sec-sales'); return s && s.style.display!=='none'; }
 function slCellPos(td){
   var tr=td.parentNode, rows=Array.prototype.indexOf.call(tr.parentNode.children, tr);
@@ -838,7 +926,8 @@ function slSelClear(){ if(SL.sel){ SL.sel=null; slSelPaint(); } }
 function slSelMulti(){ if(!SL.sel) return false; var b=slSelBox(); return b.r1!==b.r2||b.c1!==b.c2; }
 document.addEventListener('mousedown', function(e){
   var td=e.target.closest && e.target.closest('#slTable tbody td');
-  if(!td || td.classList.contains('del')){ if(!(e.target.closest&&e.target.closest('#slTable'))) slSelClear(); return; }
+  if(!td || td.classList.contains('del')){
+    if(!(e.target.closest&&e.target.closest('#slTable tbody'))) slSelClear(); return; }
   var pos=slCellPos(td);
   if(e.shiftKey){
     var a=SL.sel?SL.sel.a:null;
@@ -866,10 +955,11 @@ function slCellText(r,c){
   if(col.k==='total') return slFmt(slTotal(r));
   if(col.k==='order') return slFmt(slOrderVal(r));
   if(col.ty==='status') return r.order_manual!=null?'✎':(slOrder(r).any?'✓':'');
+  if(col.ty==='nid') return r.n||'';
   return col.ty==='num'?slFmt(r[col.k]):(r[col.k]||'');
 }
 document.addEventListener('copy', function(e){
-  if(!SL.sel || SL.dlg || !slSecVisible()) return;
+  if(!SL.sel || SL.dlg || !slSecVisible() || slInHead()) return;
   var ae=document.activeElement;
   if(!slSelMulti() && ae && ae.tagName==='INPUT') return;   // обычная копия текста в ячейке
   var b=slSelBox(), trs=document.querySelectorAll('#slTable tbody tr'), out=[];
@@ -880,7 +970,7 @@ document.addEventListener('copy', function(e){
   document.getElementById('slSaved').textContent='Скопировано ячеек: '+((b.r2-b.r1+1)*(b.c2-b.c1+1));
 });
 document.addEventListener('keydown', function(e){
-  if(!SL.sel || SL.dlg || !slSecVisible()) return;
+  if(!SL.sel || SL.dlg || !slSecVisible() || slInHead()) return;
   var ae=document.activeElement, inInput=ae && ae.tagName==='INPUT';
   if(e.key==='Escape'){ slSelClear(); return; }
   if((e.key==='Delete'||e.key==='Backspace') && (slSelMulti() || !inInput)){
