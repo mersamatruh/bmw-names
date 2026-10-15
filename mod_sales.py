@@ -446,14 +446,19 @@ def register(ctx):
   #slTable thead{position:sticky;top:0;z-index:2}
   #slTable tr.ttl th{user-select:none}
   #slTable th.csel{background:#dbe7fb}
-  #slTable tr.ttl th{position:relative;padding-right:20px}
-  #slTable th .ar{cursor:pointer;position:absolute;top:4px;right:3px;padding:1px 3px;border-radius:4px}
+  #slTable tr.ttl th{position:relative}
+  #slTable tr.ttl th{padding-right:26px}
+  #slTable th .ar{cursor:pointer;position:absolute;top:3px;right:3px;width:20px;height:26px;
+        display:flex;flex-direction:column;align-items:center;justify-content:center;
+        border-radius:5px;line-height:1}
+  #slTable th .ar i{font-style:normal;font-size:11px;color:#c3cad5;height:11px}
   #slTable th .ar:hover{background:#e3edfb}
-  #slTable th .ar.dim{color:#b8c0cc}
+  #slTable th .ar:hover i{color:#8aa6d6}
+  #slTable th .ar.asc i.u,#slTable th .ar.desc i.d{color:var(--blue);font-size:14px;height:13px}
+  #slTable th .ar.asc i.d,#slTable th .ar.desc i.u{color:#dde2ea}
   #slTable th{background:var(--panel);white-space:normal;vertical-align:bottom;
               font-size:11px;line-height:1.25}
   #slTable th.srt{cursor:pointer}
-  #slTable th .ar{color:var(--blue);font-size:12px}
   #slTable tr.flt th{padding:3px 4px;background:#f7f9fb;border-bottom:2px solid var(--line)}
   #slTable tr.flt input,#slTable tr.flt select{width:100%;box-sizing:border-box;padding:3px 5px;
         border:1px solid var(--line);border-radius:4px;font:12px/1.3 inherit;background:#fff;min-width:40px}
@@ -495,7 +500,7 @@ def register(ctx):
   #slTable td.order.good{background-color:#cdeed8}
   #slTable td.order.good input{color:#166534}
   #slTable tr.cur td.order.good{background-color:#b6e5c6}
-  #slTable td.sel{background:#cfe0fb !important;box-shadow:inset 0 0 0 1px #8fb3ef}
+  #slTable td.sel{background:#d6e5fc !important;border-color:#d6e5fc}   /* внутри блока — без сетки, рамка только снаружи */
   #slTable td.sel input{background:transparent}
   #slTable td.nm.miss{color:var(--mut);font-style:italic}
   #slTable td.del{width:28px;text-align:center}
@@ -677,7 +682,7 @@ function slHead(){
   if(!t.tHead.rows.length){
     var h='<tr class="ttl">'; SL_COLS.forEach(function(c){
       h+='<th class="'+c.ty+' srt" data-k="'+c.k+'" title="Клик — выделить весь столбец (Shift+клик — несколько столбцов); ⇅ — сортировка">'+c.t
-        +' <span class="ar" title="Сортировка">⇅</span></th>';});
+        +' <span class="ar" title="Сортировка: ▲ по возрастанию, ▼ по убыванию"><i class="u">▲</i><i class="d">▼</i></span></th>';});
     h+='<th></th></tr><tr class="flt">';
     SL_COLS.forEach(function(c){
       if(c.ty==='status') h+='<th><select data-f="status"><option value="">все</option>'
@@ -690,8 +695,8 @@ function slHead(){
   }
   t.tHead.querySelectorAll('tr.ttl th[data-k]').forEach(function(th){
     var k=th.dataset.k, ar=th.querySelector('.ar');
-    var on=SL.sort&&SL.sort.k===k; ar.textContent=on?(SL.sort.dir>0?'▲':'▼'):'⇅';
-    ar.classList.toggle('dim', !on); });
+    var on=SL.sort&&SL.sort.k===k;
+    ar.classList.toggle('asc', !!on && SL.sort.dir>0); ar.classList.toggle('desc', !!on && SL.sort.dir<0); });
   t.tHead.querySelectorAll('tr.flt [data-f]').forEach(function(el){
     var v=SL.colf[el.dataset.f]||''; if(el.value!==v) el.value=v; el.classList.toggle('on', !!v); });
 }
@@ -1017,14 +1022,19 @@ function slCellPos(td){
 function slSelBox(){ var a=SL.sel.a, b=SL.sel.b;
   return {r1:Math.min(a.r,b.r), r2:Math.max(a.r,b.r), c1:Math.min(a.c,b.c), c2:Math.min(Math.max(a.c,b.c), SL_COLS.length-1)}; }
 function slSelPaint(){
-  document.querySelectorAll('#slTable td.sel').forEach(function(td){ td.classList.remove('sel'); });
+  document.querySelectorAll('#slTable td.sel').forEach(function(td){ td.classList.remove('sel'); td.style.boxShadow=''; });
   document.querySelectorAll('#slTable th.csel').forEach(function(th){ th.classList.remove('csel'); });
   if(!SL.sel) return;
   if(SL.sel.col){ var hb=slSelBox(), ths=document.querySelectorAll('#slTable tr.ttl th');
     for(var hc=hb.c1;hc<=hb.c2;hc++) if(ths[hc]) ths[hc].classList.add('csel'); }
   var b=slSelBox(), trs=document.querySelectorAll('#slTable tbody tr');
   for(var r=b.r1;r<=b.r2;r++){ var tr=trs[r]; if(!tr) continue;
-    for(var c=b.c1;c<=b.c2;c++) if(tr.children[c]) tr.children[c].classList.add('sel'); }
+    for(var c=b.c1;c<=b.c2;c++){ var td=tr.children[c]; if(!td) continue;
+      td.classList.add('sel');
+      var sh=[], L='#4a86e8';                 // одна рамка вокруг всего блока
+      if(r===b.r1) sh.push('inset 0 2px 0 '+L); if(r===b.r2) sh.push('inset 0 -2px 0 '+L);
+      if(c===b.c1) sh.push('inset 2px 0 0 '+L); if(c===b.c2) sh.push('inset -2px 0 0 '+L);
+      td.style.boxShadow=sh.join(','); } }
 }
 function slSelClear(){ if(SL.sel){ SL.sel=null; slSelPaint(); } }
 function slSelMulti(){ if(!SL.sel) return false; var b=slSelBox(); return b.r1!==b.r2||b.c1!==b.c2; }
