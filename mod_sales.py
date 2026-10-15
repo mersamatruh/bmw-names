@@ -376,8 +376,8 @@ def register(ctx):
   </div>
   <div class="bar">
     <label class="hint">Период продаж: с
-      <input id="slFrom" class="sldate" type="date"> по
-      <input id="slTo" class="sldate" type="date"></label>
+      <input id="slFrom" class="sldate" type="date" min="2000-01-01" max="2099-12-31"> по
+      <input id="slTo" class="sldate" type="date" min="2000-01-01" max="2099-12-31"></label>
     <span id="slDays" class="hint"></span>
     <label class="hint">Заказывать с запасом на, дней
       <input id="slCover" class="slnum" type="number" min="1"></label>
@@ -548,7 +548,9 @@ function slPeriodDays(){
 }
 function slShowDays(){
   var el=document.getElementById('slDays'), d=slPeriodDays();
-  el.textContent=d?('= '+d+' дн.'):('период не указан, считаю как '+(SL.settings.period_days||90)+' дн.');
+  var bad=SL.period.from && SL.period.to && SL.period.from>SL.period.to;
+  el.textContent=d?('= '+d+' дн.'):bad?'дата «с» позже даты «по» — проверьте период'
+    :('период не указан, считаю как '+(SL.settings.period_days||90)+' дн.');
   el.classList.toggle('warn', !d);
 }
 function slOrder(r){
@@ -585,6 +587,8 @@ async function slFetch(q){
   if(d.error){ alert(d.error); return false; }
   SL.rows=d.rows||[]; SL.names=d.names||{}; SL.settings=d.settings||SL.settings;
   SL.id=d.id||null; SL.period=d.period||{}; slSnapList(d.snapshots);
+  ['from','to'].forEach(function(k){   // битый год (0002…) из старой версии — сбросить
+    if(SL.period[k] && !/^20\d\d-/.test(SL.period[k])) SL.period[k]=''; });
   document.getElementById('slFrom').value=SL.period.from||'';
   document.getElementById('slTo').value=SL.period.to||'';
   slShowDays(); slLessonsCount(d.lessons_count);
@@ -1118,11 +1122,17 @@ function slExport(){
   }); })();
 ['slFrom','slTo'].forEach(function(id){
   var el=document.getElementById(id); if(!el) return;
+  // Chrome шлёт change на каждую цифру года (2 → 0002, 20 → 0020…), поэтому
+  // недописанный год пропускаем, а не сохраняем; и никаких alert — он сбивал ввод
   el.addEventListener('change', function(){
-    SL.period[id==='slFrom'?'from':'to']=el.value||'';
-    if(SL.period.from && SL.period.to && SL.period.from>SL.period.to){
-      alert('Дата «с» позже даты «по» — проверьте период.'); }
+    var v=el.value||'';
+    if(v && !/^(20\d\d)-\d\d-\d\d$/.test(v)) return;
+    SL.period[id==='slFrom'?'from':'to']=v;
     slShowDays(); slRefreshCalc(); slSave();
+  });
+  el.addEventListener('blur', function(){   // ушли из поля с недописанным годом — вернуть сохранённое
+    var k=id==='slFrom'?'from':'to';
+    if((el.value||'')!==(SL.period[k]||'')) el.value=SL.period[k]||'';
   });
 });
 (function(){ var s=document.getElementById('slSearch'); if(!s) return;
