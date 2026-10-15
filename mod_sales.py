@@ -477,6 +477,8 @@ def register(ctx):
               box-shadow:0 10px 40px rgba(0,0,0,.25)}
   .sldlg textarea{width:100%;box-sizing:border-box;margin-top:10px;padding:8px;font:inherit;
                   border:1px solid var(--line);border-radius:6px}
+  #slTable tr.cur td{background-color:#eaf3ff}
+  #slTable tr.cur td.order{background-color:#ffd4a8}
   #slTable td.sel{background:#cfe0fb !important;box-shadow:inset 0 0 0 1px #8fb3ef}
   #slTable td.sel input{background:transparent}
   #slTable td.nm.miss{color:var(--mut);font-style:italic}
@@ -724,7 +726,25 @@ function slRender(){
   SL.rows.forEach(function(r,i){ if(slVisible(i)) b+=slRowHtml(r,i); });
   t.tBodies[0].innerHTML=b;
   if(SL.sel) slSelPaint();
+  slCurPaint();
 }
+/* текущая строка (где щёлкнули/стоит курсор) подсвечивается голубым — только для глаз,
+   на копирование не влияет */
+function slCurPaint(){
+  document.querySelectorAll('#slTable tr.cur').forEach(function(tr){ tr.classList.remove('cur'); });
+  var i=SL.cur?SL.rows.indexOf(SL.cur):-1; if(i<0) return;
+  var tr=document.querySelector('#slTable tbody tr[data-i="'+i+'"]'); if(tr) tr.classList.add('cur');
+}
+function slSetCur(el){
+  var tr=el && el.closest && el.closest('#slTable tbody tr[data-i]'); if(!tr) return;
+  var r=SL.rows[+tr.dataset.i]; if(r && r!==SL.cur){ SL.cur=r; slCurPaint(); }
+}
+document.addEventListener('focusin', function(e){
+  slSetCur(e.target);
+  // переход стрелками/Enter — выделение переезжает вместе с курсором
+  var td=e.target.closest && e.target.closest('#slTable tbody td');
+  if(td && !SL.drag && SL.sel && !slSelMulti()){ var pos=slCellPos(td); SL.sel={a:pos, b:pos}; slSelPaint(); }
+});
 function slRowHtml(r,i){
   var h='<tr data-i="'+i+'">';
   SL_COLS.forEach(function(c,ci){ h+=slCellHtml(r,i,c,ci); });
@@ -946,7 +966,7 @@ document.addEventListener('mousedown', function(e){
   var td=e.target.closest && e.target.closest('#slTable tbody td');
   if(!td || td.classList.contains('del')){
     if(!(e.target.closest&&e.target.closest('#slTable tbody, #slTable tr.ttl'))) slSelClear(); return; }
-  var pos=slCellPos(td);
+  var pos=slCellPos(td); slSetCur(td);
   if(e.shiftKey){
     var a=SL.sel?SL.sel.a:null;
     if(!a){ var f=document.activeElement; var ftd=f&&f.closest&&f.closest('#slTable tbody td'); if(ftd) a=slCellPos(ftd); }
