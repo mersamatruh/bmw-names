@@ -296,7 +296,7 @@ def register(ctx):
     SECTION_HTML = """
   <h2 style="margin:0 0 4px">📈 Анализ продаж</h2>
   <p class="hint" style="margin:0 0 14px">Анализатор продаж Porsche (пробная версия).
-    Вносите позиции или вставляйте столбцы из Excel вместе с заголовком (Ctrl+V в ячейку первой строки) — заголовок отбросится. Всё
+    Вносите позиции или вставляйте столбцы из Excel вместе с заголовком (Ctrl+V в ячейку первой строки) — заголовок отбросится. Блок ячеек выделяется мышкой или Shift+клик: Ctrl+C — копия, Delete — очистка. Всё
     сохраняется на сервере автоматически.</p>
   <div class="bar">
     <button onclick="slNew()">Новая партия</button>
@@ -362,6 +362,8 @@ def register(ctx):
   #slTable td.order.manual input{font-weight:800;color:#c2410c;text-decoration:underline dotted}
   #slTable th.order{background:#ffd3a3;color:#7a3a00}
   #slTable td.nm{padding:6px 8px;font-size:12px;min-width:180px}
+  #slTable td.sel{background:#cfe0fb !important;box-shadow:inset 0 0 0 1px #8fb3ef}
+  #slTable td.sel input{background:transparent}
   #slTable td.nm.miss{color:var(--mut);font-style:italic}
   #slTable td.del{width:28px;text-align:center}
   #slTable td.del button{border:none;background:none;color:var(--mut);padding:4px}
@@ -504,6 +506,7 @@ function slRender(){
   var b='';
   SL.rows.forEach(function(r,i){ if(slVisible(i)) b+=slRowHtml(r,i); });
   t.tBodies[0].innerHTML=b;
+  if(SL.sel) slSelPaint();
 }
 function slRowHtml(r,i){
   var h='<tr data-i="'+i+'">';
@@ -596,15 +599,22 @@ document.addEventListener('input', function(e){
 });
 /* вставка блока из Excel: столбцы ложатся по порядку колонок таблицы */
 document.addEventListener('paste', async function(e){
-  var el=e.target; if(!el.closest||!el.closest('#slTable')||el.dataset.c==null) return;
-  var txt=(e.clipboardData||window.clipboardData).getData('text');
-  if(txt.indexOf('\t')<0 && txt.indexOf('\n')<0) return;
-  e.preventDefault();
+  var el=e.target, txt=(e.clipboardData||window.clipboardData).getData('text');
+  if(el.closest && el.closest('#slTable') && el.dataset.c!=null){
+    if(txt.indexOf('\t')<0 && txt.indexOf('\n')<0) return;
+    e.preventDefault(); slSelClear(); await slPasteAt(+el.dataset.i, +el.dataset.c, txt);
+  } else if(SL.sel && slSecVisible()){
+    e.preventDefault();
+    var b=slSelBox(), tr=document.querySelectorAll('#slTable tbody tr')[b.r1];
+    if(tr) await slPasteAt(+tr.dataset.i, b.c1, txt);
+  }
+});
+async function slPasteAt(i0, c0, txt){
   var lines=txt.replace(/\r/g,'').split('\n');
   if(lines.length && lines[lines.length-1]==='') lines.pop();
   var head='', sk=document.getElementById('slSkipHead');
   if(sk && sk.checked && lines.length>1){ head=lines.shift().replace(/\t/g,' | ').trim(); }
-  var i0=+el.dataset.i, c0=+el.dataset.c, arts=[];
+  var arts=[];
   lines.forEach(function(line,li){
     var i=i0+li; while(SL.rows.length<=i) SL.rows.push({});
     var cells=line.split('\t');
@@ -618,6 +628,81 @@ document.addEventListener('paste', async function(e){
   if(head) setTimeout(function(){
     document.getElementById('slSaved').textContent='Вставлено строк: '+lines.length
       +' · убран заголовок «'+head+'»'; }, 1500);
+}
+
+/* ---------- выделение блока ячеек, как в Excel ----------
+   протянуть мышкой или Shift+клик; Ctrl+C — копия, Delete — очистка,
+   Ctrl+V — вставка с левого верхнего угла; Esc — снять выделение */
+SL.sel=null; SL.drag=null;
+function slSecVisible(){ var s=document.getElementById('sec-sales'); return s && s.style.display!=='none'; }
+function slCellPos(td){
+  var tr=td.parentNode, rows=Array.prototype.indexOf.call(tr.parentNode.children, tr);
+  return {r:rows, c:Array.prototype.indexOf.call(tr.children, td)};
+}
+function slSelBox(){ var a=SL.sel.a, b=SL.sel.b;
+  return {r1:Math.min(a.r,b.r), r2:Math.max(a.r,b.r), c1:Math.min(a.c,b.c), c2:Math.min(Math.max(a.c,b.c), SL_COLS.length-1)}; }
+function slSelPaint(){
+  document.querySelectorAll('#slTable td.sel').forEach(function(td){ td.classList.remove('sel'); });
+  if(!SL.sel) return;
+  var b=slSelBox(), trs=document.querySelectorAll('#slTable tbody tr');
+  for(var r=b.r1;r<=b.r2;r++){ var tr=trs[r]; if(!tr) continue;
+    for(var c=b.c1;c<=b.c2;c++) if(tr.children[c]) tr.children[c].classList.add('sel'); }
+}
+function slSelClear(){ if(SL.sel){ SL.sel=null; slSelPaint(); } }
+function slSelMulti(){ if(!SL.sel) return false; var b=slSelBox(); return b.r1!==b.r2||b.c1!==b.c2; }
+document.addEventListener('mousedown', function(e){
+  var td=e.target.closest && e.target.closest('#slTable tbody td');
+  if(!td || td.classList.contains('del')){ if(!(e.target.closest&&e.target.closest('#slTable'))) slSelClear(); return; }
+  var pos=slCellPos(td);
+  if(e.shiftKey){
+    var a=SL.sel?SL.sel.a:null;
+    if(!a){ var f=document.activeElement; var ftd=f&&f.closest&&f.closest('#slTable tbody td'); if(ftd) a=slCellPos(ftd); }
+    if(a){ e.preventDefault(); if(document.activeElement) document.activeElement.blur();
+      SL.sel={a:a, b:pos}; slSelPaint(); return; }
+  }
+  SL.drag=pos; SL.sel={a:pos, b:pos}; slSelPaint();
+});
+document.addEventListener('mouseover', function(e){
+  if(!SL.drag || !(e.buttons&1)) return;
+  var td=e.target.closest && e.target.closest('#slTable tbody td');
+  if(!td || td.classList.contains('del')) return;
+  var pos=slCellPos(td);
+  if(pos.r===SL.sel.b.r && pos.c===SL.sel.b.c) return;
+  SL.sel.b=pos;
+  if(slSelMulti()){ if(document.activeElement) document.activeElement.blur();
+    if(window.getSelection) window.getSelection().removeAllRanges(); }
+  slSelPaint();
+});
+document.addEventListener('mouseup', function(){ SL.drag=null; });
+function slCellText(r,c){
+  var col=SL_COLS[c];
+  if(col.k==='name') return slName(r);
+  if(col.k==='total') return slFmt(slTotal(r));
+  if(col.k==='order') return slFmt(slOrderVal(r));
+  return col.ty==='num'?slFmt(r[col.k]):(r[col.k]||'');
+}
+document.addEventListener('copy', function(e){
+  if(!SL.sel || !slSecVisible()) return;
+  var ae=document.activeElement;
+  if(!slSelMulti() && ae && ae.tagName==='INPUT') return;   // обычная копия текста в ячейке
+  var b=slSelBox(), trs=document.querySelectorAll('#slTable tbody tr'), out=[];
+  for(var r=b.r1;r<=b.r2;r++){ var tr=trs[r]; if(!tr) continue; var row=SL.rows[+tr.dataset.i], line=[];
+    for(var c=b.c1;c<=b.c2;c++) line.push((slCellText(row,c)+'').replace(/[\t\n]/g,' '));
+    out.push(line.join('\t')); }
+  e.clipboardData.setData('text/plain', out.join('\r\n')); e.preventDefault();
+  document.getElementById('slSaved').textContent='Скопировано ячеек: '+((b.r2-b.r1+1)*(b.c2-b.c1+1));
+});
+document.addEventListener('keydown', function(e){
+  if(!SL.sel || !slSecVisible()) return;
+  var ae=document.activeElement, inInput=ae && ae.tagName==='INPUT';
+  if(e.key==='Escape'){ slSelClear(); return; }
+  if((e.key==='Delete'||e.key==='Backspace') && (slSelMulti() || !inInput)){
+    e.preventDefault(); if(inInput) ae.blur();
+    var b=slSelBox(), trs=document.querySelectorAll('#slTable tbody tr');
+    for(var r=b.r1;r<=b.r2;r++){ var tr=trs[r]; if(!tr) continue;
+      for(var c=b.c1;c<=b.c2;c++) slSetCell(+tr.dataset.i, c, ''); }
+    slRender(); slSelPaint(); slSave();
+  }
 });
 (function(){ var sk=document.getElementById('slSkipHead'); if(!sk) return;
   try{ if(localStorage.getItem('slSkipHead')==='0') sk.checked=false; }catch(e){}
