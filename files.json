@@ -1,4 +1,5 @@
 [
   "server.py",
-  "mod_reminders.py"
+  "mod_reminders.py",
+  "mod_sales.py"
 ]
