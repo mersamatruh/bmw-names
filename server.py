@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "2.3 от 14.10.2026"
+VERSION = "3.0 от 15.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -636,7 +636,25 @@ def api_snap_delete():
     return jsonify({"ok": True})
 
 
-GH_RAW_URL = "https://raw.githubusercontent.com/mersamatruh/bmw-names/main/server.py"
+GH_RAW_BASE = "https://raw.githubusercontent.com/mersamatruh/bmw-names/main/"
+GH_MANIFEST = GH_RAW_BASE + "files.json"
+
+
+def _fetch(url):
+    import urllib.request as _ur
+    sep = "&" if "?" in url else "?"
+    req = _ur.Request(url + sep + "nocache=" + str(int(time.time())),
+                      headers={"User-Agent": "bmw-names-updater",
+                               "Cache-Control": "no-cache"})
+    return _ur.urlopen(req, timeout=30).read()
+
+
+def _safe_name(fn):
+    """Разрешаем только простые имена .py-файлов в текущей папке."""
+    import re as _re
+    return (isinstance(fn, str) and fn.endswith(".py")
+            and "/" not in fn and ".." not in fn
+            and bool(_re.fullmatch(r"[A-Za-z0-9_.\-]+", fn)))
 
 
 def _install_code(code: str):
@@ -667,23 +685,64 @@ def _install_code(code: str):
 
 @app.post("/api/update_github")
 def update_github():
-    """Скачивает свежий server.py из GitHub-репозитория и устанавливает его."""
+    """Скачивает все файлы проекта по манифесту files.json из GitHub и ставит их.
+
+    Если манифеста нет — обновляет только server.py (как раньше)."""
     if not check_auth(request):
         return jsonify({"error": "Неверный пароль"}), 401
     if not APP_PASSWORD:
         return jsonify({"error": "Обновление доступно только при заданном APP_PASSWORD"}), 403
+
+    # 1) список файлов; при любой проблеме — страховка на server.py
     try:
-        import urllib.request as _ur
-        req = _ur.Request(GH_RAW_URL + "?nocache=" + str(int(time.time())),
-                          headers={"User-Agent": "bmw-names-updater",
-                                   "Cache-Control": "no-cache"})
-        code = _ur.urlopen(req, timeout=30).read().decode("utf-8")
-    except Exception as e:
-        return jsonify({"error": f"Не удалось скачать с GitHub: {e}"}), 502
-    err = _install_code(code)
-    if err:
-        return jsonify({"error": err}), 400
-    return jsonify({"ok": True})
+        files = json.loads(_fetch(GH_MANIFEST).decode("utf-8"))
+        if not isinstance(files, list):
+            raise ValueError("manifest не список")
+    except Exception:
+        files = ["server.py"]
+    files = [f for f in files if _safe_name(f)]
+    if "server.py" not in files:
+        files.append("server.py")
+
+    # 2) скачать всё заранее (ничего не пишем, пока не проверим)
+    downloaded = {}
+    for fn in files:
+        try:
+            downloaded[fn] = _fetch(GH_RAW_BASE + fn).decode("utf-8")
+        except Exception as e:
+            return jsonify({"error": f"Не удалось скачать {fn}: {e}"}), 502
+
+    # 3) проверка синтаксиса каждого файла
+    for fn, code in downloaded.items():
+        try:
+            compile(code, fn, "exec")
+        except SyntaxError as e:
+            return jsonify({"error": f"Синтаксическая ошибка в {fn}, обновление отменено: {e}"}), 400
+
+    # 4) server.py должен остаться нашим
+    sv = downloaded.get("server.py", "")
+    if "генератор наименований" not in sv or "app.run" not in sv:
+        return jsonify({"error": "server.py не похож на наш — обновление отменено"}), 400
+
+    # 5) бэкап и запись всех файлов
+    import shutil as _sh
+    base = os.path.dirname(os.path.abspath(__file__))
+    for fn, code in downloaded.items():
+        path = os.path.join(base, fn)
+        try:
+            if os.path.exists(path):
+                _sh.copy(path, path + ".bak")
+        except Exception:
+            pass
+        with open(path, "w", encoding="utf-8") as fp:
+            fp.write(code)
+
+    # 6) перезапуск
+    def _restart():
+        os.execv(sys.executable, [sys.executable,
+                                  os.path.join(base, "server.py")])
+    threading.Timer(1.5, _restart).start()
+    return jsonify({"ok": True, "files": sorted(downloaded.keys())})
 
 
 @app.post("/api/update_code")
@@ -815,18 +874,8 @@ PAGE = r"""<!doctype html>
           display:flex;gap:8px;padding:8px}
     .side .navitem{margin-bottom:0}
   }
-  /* --- раздел «Бот напоминатель» --- */
-  #remName{flex:1;min-width:220px;padding:8px 10px;border:1px solid var(--line);
-           border-radius:6px;font:inherit}
-  #remPeriod{width:130px;padding:8px 10px;border:1px solid var(--line);
-             border-radius:6px;font:inherit}
-  .remcard{background:var(--panel);border:1px solid var(--line);border-radius:8px;
-           padding:11px 14px;margin-bottom:8px;display:flex;align-items:center;
-           gap:12px;max-width:720px}
-  .remcard .nm{font-weight:600}
-  .remcard .pd{color:var(--mut);font-size:13px}
-  .remcard .sp{flex:1}
-  .remcard.arch{opacity:.65}
+  /* --- CSS подпроектов (модулей) --- */
+  {{ module_css }}
 </style>
 </head>
 <body>
@@ -837,7 +886,7 @@ PAGE = r"""<!doctype html>
 <div class="layout">
   <nav class="side">
     <button class="navitem active" data-sec="names">📝 Названия</button>
-    <button class="navitem" data-sec="bot">🔔 Бот напоминатель</button>
+    {{ module_nav }}
   </nav>
   <div class="content">
 <main id="sec-names">
@@ -887,21 +936,7 @@ PAGE = r"""<!doctype html>
     <tbody id="tb"></tbody>
   </table>
 </main>
-<main id="sec-bot" style="display:none">
-  <h2 style="margin:0 0 4px">🔔 Бот напоминатель</h2>
-  <p class="hint" style="margin:0 0 14px">Регулярные платежи. Укажи название и окно дней
-    месяца, когда напоминать, — бот будет напоминать каждое утро, пока платёж не отмечен.</p>
-  <div class="bar">
-    <input id="remName" placeholder="Название — напр. Электроэнергия"
-           onkeydown="if(event.key==='Enter')addReminder()">
-    <input id="remPeriod" placeholder="Окно: 1-14"
-           onkeydown="if(event.key==='Enter')addReminder()">
-    <button class="primary" onclick="addReminder()">Добавить напоминание</button>
-    <span class="hint">Окно — дни месяца. Пример: <b>1-14</b>. Один день — просто <b>10</b>.</span>
-  </div>
-  <div id="remMsg" class="hint" style="margin-bottom:10px;color:var(--err)"></div>
-  <div id="remList"></div>
-</main>
+{{ module_sections }}
   </div><!-- .content -->
 </div><!-- .layout -->
 
@@ -1274,69 +1309,6 @@ async function apiGet(path){
   return res.json();
 }
 
-/* ---- раздел «Бот напоминатель» ---- */
-function remEsc(s){return (s+'').replace(/[&<>"]/g,function(c){
-  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
-function remPeriodStr(s,e){return s===e?(s+' числа'):('с '+s+' по '+e+' число');}
-function parseRemPeriod(t){
-  t=(t||'').replace(/[—–]/g,'-').trim();
-  var parts = t.indexOf('-')>=0 ? t.split('-') : t.split(/\s+/);
-  var nums=[];
-  for(var i=0;i<parts.length;i++){var x=parts[i].trim();
-    if(x!==''){ if(!/^\d+$/.test(x)) return null; nums.push(parseInt(x,10)); }}
-  var s,e;
-  if(nums.length===1){s=e=nums[0];}
-  else if(nums.length===2){s=nums[0];e=nums[1];}
-  else return null;
-  if(!(s>=1&&s<=31&&e>=1&&e<=31)||s>e) return null;
-  return [s,e];
-}
-async function loadReminders(){
-  var box=document.getElementById('remList'); if(!box) return;
-  box.innerHTML='<div class="hint">Загрузка…</div>';
-  try{ var d=await apiGet('/api/reminders'); renderReminders(d.reminders||[]); }
-  catch(e){ box.innerHTML='<div class="hint">Не удалось загрузить список.</div>'; }
-}
-function renderReminders(items){
-  var box=document.getElementById('remList'); if(!box) return;
-  var act=items.filter(function(r){return r.active;});
-  var arch=items.filter(function(r){return !r.active;});
-  var html='';
-  if(!act.length && !arch.length) html='<div class="hint">Пока нет ни одного напоминания.</div>';
-  act.forEach(function(r){
-    html+='<div class="remcard"><span class="nm">🔔 '+remEsc(r.name)+'</span>'
-      +'<span class="pd">'+remPeriodStr(r.start,r.end)+'</span><span class="sp"></span>'
-      +'<button onclick="archiveReminder('+r.id+',false)">📦 В архив</button></div>';
-  });
-  if(arch.length){
-    html+='<div class="hint" style="margin:14px 0 6px">Архив</div>';
-    arch.forEach(function(r){
-      html+='<div class="remcard arch"><span class="nm">'+remEsc(r.name)+'</span>'
-        +'<span class="pd">'+remPeriodStr(r.start,r.end)+'</span><span class="sp"></span>'
-        +'<button onclick="archiveReminder('+r.id+',true)">↩️ Вернуть</button></div>';
-    });
-  }
-  box.innerHTML=html;
-}
-async function addReminder(){
-  var nm=document.getElementById('remName'), pd=document.getElementById('remPeriod'),
-      msg=document.getElementById('remMsg');
-  var name=(nm.value||'').trim();
-  var per=parseRemPeriod(pd.value);
-  if(!name){ msg.textContent='Впишите название.'; return; }
-  if(!per){ msg.textContent='Окно неверное. Пример: 1-14 или одно число 10 (дни 1–31).'; return; }
-  msg.textContent='';
-  try{
-    var r=await api('/api/reminder_add',{name:name,start:per[0],end:per[1]});
-    if(r && r.error){ msg.textContent=r.error; return; }
-    nm.value=''; pd.value=''; loadReminders();
-  }catch(e){ msg.textContent='Не удалось сохранить.'; }
-}
-async function archiveReminder(id, active){
-  try{ await api('/api/reminder_archive',{id:id,active:active}); loadReminders(); }
-  catch(e){}
-}
-
 let jobId=null, pollTimer=null, pendingSrv=null;
 
 function setRunning(on){
@@ -1559,190 +1531,84 @@ $('#btnCsv').onclick=()=>{
 $('#refcount').textContent='{{ refcount }}';
 render();
 if(!NEED_PW || AUTH) init();
+// доступно подпроектам (модулям)
+window.$=$; window.api=api; window.apiGet=apiGet;
 </script>
 <script>
-/* переключение разделов левого меню (v2.0) */
+/* JS подпроектов (модулей) */
+{{ module_js }}
+</script>
+<script>
+/* переключение разделов левого меню (универсальное) */
 (function(){
   var items = document.querySelectorAll('.side .navitem');
-  var secs = { names: document.getElementById('sec-names'),
-               bot:   document.getElementById('sec-bot') };
   function show(sec){
-    for(var k in secs){ if(secs[k]) secs[k].style.display = (k===sec ? '' : 'none'); }
-    items.forEach(function(b){ b.classList.toggle('active', b.dataset.sec===sec); });
+    items.forEach(function(b){
+      var el = document.getElementById('sec-'+b.dataset.sec);
+      if(el) el.style.display = (b.dataset.sec===sec ? '' : 'none');
+      b.classList.toggle('active', b.dataset.sec===sec);
+    });
     try{ localStorage.setItem('section', sec); }catch(e){}
-    if(sec==='bot' && typeof loadReminders==='function') loadReminders();
+    var cb = window['onShow_'+sec];
+    if(typeof cb==='function'){ try{ cb(); }catch(e){} }
   }
   items.forEach(function(b){ b.addEventListener('click', function(){ show(b.dataset.sec); }); });
   var saved=null;
   try{ saved = localStorage.getItem('section'); }catch(e){}
-  if(saved && secs[saved]) show(saved);
+  if(saved && document.getElementById('sec-'+saved)) show(saved);
 })();
 </script>
 </body>
 </html>"""
 
 
-REMINDERS_PATH = "reminders.json"
+# ---------- Подпроекты (модули) ----------
+# Ядро само находит файлы mod_*.py рядом с server.py и подключает их.
+# Каждый модуль определяет register(ctx) и возвращает
+# {id, title, section_html, css, js}; свои /api-маршруты регистрирует сам.
+HERE = os.path.dirname(os.path.abspath(__file__))
+MODULES = []
 
 
-def load_reminders():
-    data = {"seq": 0, "items": [], "marks": []}
-    if os.path.exists(REMINDERS_PATH):
+def _load_modules():
+    import importlib.util
+    import glob
+    ctx = {
+        "app": app, "check_auth": check_auth, "lock": lock,
+        "jsonify": jsonify, "request": request, "data_dir": HERE,
+    }
+    for path in sorted(glob.glob(os.path.join(HERE, "mod_*.py"))):
+        name = os.path.splitext(os.path.basename(path))[0]
         try:
-            with open(REMINDERS_PATH, encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            pass
-    data.setdefault("seq", 0)
-    data.setdefault("items", [])
-    data.setdefault("marks", [])  # [{rid, period "YYYY-MM", at, by}]
-    return data
+            spec = importlib.util.spec_from_file_location(name, path)
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            info = m.register(ctx)
+            if info:
+                MODULES.append(info)
+                print(f"Модуль подключён: {name} → «{info.get('title', '')}»")
+        except Exception as e:
+            print(f"Модуль пропущен ({name}): {e}")
 
 
-def save_reminders(data):
-    with open(REMINDERS_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-@app.get("/api/reminders")
-def api_reminders():
-    if not check_auth(request):
-        return jsonify({"error": "Неверный пароль"}), 401
-    return jsonify({"reminders": load_reminders()["items"]})
-
-
-@app.post("/api/reminder_add")
-def api_reminder_add():
-    if not check_auth(request):
-        return jsonify({"error": "Неверный пароль"}), 401
-    d = request.get_json(force=True)
-    name = str(d.get("name", "")).strip()
-    try:
-        start = int(d.get("start"))
-        end = int(d.get("end"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "Неверное окно"}), 400
-    if not name:
-        return jsonify({"error": "Нужно название"}), 400
-    if not (1 <= start <= 31 and 1 <= end <= 31) or start > end:
-        return jsonify({"error": "Окно: дни 1–31, начало не позже конца"}), 400
-    with lock:
-        data = load_reminders()
-        data["seq"] += 1
-        item = {"id": data["seq"], "name": name, "start": start,
-                "end": end, "active": True}
-        data["items"].append(item)
-        save_reminders(data)
-    return jsonify({"ok": True, "reminder": item})
-
-
-@app.post("/api/reminder_archive")
-def api_reminder_archive():
-    if not check_auth(request):
-        return jsonify({"error": "Неверный пароль"}), 401
-    d = request.get_json(force=True)
-    rid = d.get("id")
-    active = bool(d.get("active"))
-    found = False
-    with lock:
-        data = load_reminders()
-        for it in data["items"]:
-            if it["id"] == rid:
-                it["active"] = active
-                found = True
-                break
-        if found:
-            save_reminders(data)
-    return jsonify({"ok": found})
-
-
-@app.post("/api/reminder_period")
-def api_reminder_period():
-    if not check_auth(request):
-        return jsonify({"error": "Неверный пароль"}), 401
-    d = request.get_json(force=True)
-    rid = d.get("id")
-    try:
-        start = int(d.get("start"))
-        end = int(d.get("end"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "Неверное окно"}), 400
-    if not (1 <= start <= 31 and 1 <= end <= 31) or start > end:
-        return jsonify({"error": "Окно: дни 1–31, начало не позже конца"}), 400
-    found = False
-    with lock:
-        data = load_reminders()
-        for it in data["items"]:
-            if it["id"] == rid:
-                it["start"] = start
-                it["end"] = end
-                found = True
-                break
-        if found:
-            save_reminders(data)
-    return jsonify({"ok": found})
-
-
-@app.get("/api/marks")
-def api_marks():
-    if not check_auth(request):
-        return jsonify({"error": "Неверный пароль"}), 401
-    period = request.args.get("period", "")
-    marks = load_reminders()["marks"]
-    paid = [m["rid"] for m in marks if m.get("period") == period]
-    return jsonify({"period": period, "paid": paid})
-
-
-@app.post("/api/mark")
-def api_mark():
-    if not check_auth(request):
-        return jsonify({"error": "Неверный пароль"}), 401
-    d = request.get_json(force=True)
-    try:
-        rid = int(d.get("rid"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "Нужен rid"}), 400
-    period = str(d.get("period", "")).strip()
-    by = str(d.get("by", "")).strip()
-    if not re.fullmatch(r"\d{4}-\d{2}", period):
-        return jsonify({"error": "Неверный период"}), 400
-    with lock:
-        data = load_reminders()
-        already = any(m["rid"] == rid and m["period"] == period for m in data["marks"])
-        if not already:
-            data["marks"].append({
-                "rid": rid, "period": period,
-                "at": datetime.datetime.now().isoformat(timespec="seconds"),
-                "by": by,
-            })
-            save_reminders(data)
-    return jsonify({"ok": True, "already": already})
-
-
-@app.post("/api/unmark")
-def api_unmark():
-    if not check_auth(request):
-        return jsonify({"error": "Неверный пароль"}), 401
-    d = request.get_json(force=True)
-    try:
-        rid = int(d.get("rid"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "Нужен rid"}), 400
-    period = str(d.get("period", "")).strip()
-    with lock:
-        data = load_reminders()
-        before = len(data["marks"])
-        data["marks"] = [m for m in data["marks"]
-                         if not (m["rid"] == rid and m["period"] == period)]
-        removed = before - len(data["marks"])
-        if removed:
-            save_reminders(data)
-    return jsonify({"ok": bool(removed)})
+_load_modules()
 
 
 @app.get("/")
 def index():
-    page = PAGE.replace("{{ need_pw }}", "true" if APP_PASSWORD else "false")
+    nav = "".join(
+        '<button class="navitem" data-sec="{id}">{title}</button>'.format(
+            id=m["id"], title=m["title"]) for m in MODULES)
+    sections = "".join(
+        '<main id="sec-{id}" style="display:none">{html}</main>'.format(
+            id=m["id"], html=m.get("section_html", "")) for m in MODULES)
+    css = "".join(m.get("css", "") for m in MODULES)
+    js = "".join(m.get("js", "") for m in MODULES)
+    page = PAGE.replace("{{ module_nav }}", nav)
+    page = page.replace("{{ module_sections }}", sections)
+    page = page.replace("{{ module_css }}", css)
+    page = page.replace("{{ module_js }}", js)
+    page = page.replace("{{ need_pw }}", "true" if APP_PASSWORD else "false")
     page = page.replace("{{ refcount }}", str(len(REFS)))
     page = page.replace("{{ version }}", VERSION)
     return Response(page, mimetype="text/html")
