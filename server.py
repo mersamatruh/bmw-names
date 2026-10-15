@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "4.0 от 15.10.2026"
+VERSION = "4.2 от 15.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -799,6 +799,7 @@ PAGE = r"""<!doctype html>
          padding:14px 22px;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
   header h1{margin:0;font-size:17px;font-weight:700;letter-spacing:.2px}
   header .sub{color:var(--mut);font-size:13px}
+  header .ghbtn{padding:4px 10px;font-size:12px;align-self:center}
   main{max-width:1280px;margin:18px auto;padding:0 16px}
   .bar{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
   button{border:1px solid var(--line);background:var(--panel);color:var(--ink);
@@ -882,6 +883,7 @@ PAGE = r"""<!doctype html>
 <header>
   <h1>Каталог BMW · генератор наименований</h1>
   <span class="sub">эталонов в базе: <b id="refcount">—</b> · справочник: <b id="catcount">—</b> · расход: <b id="spend">—</b> · версия {{ version }}{{ published }}</span>
+  <button id="btnGh" class="ghbtn" title="Скачать и установить свежую версию из GitHub">🔄 Обновить с GitHub</button>
 </header>
 <div class="layout">
   <nav class="side">
@@ -904,7 +906,6 @@ PAGE = r"""<!doctype html>
     <button id="btnDelSnap" title="Удалить выбранный слепок с сервера">Удалить</button>
     <button id="btnCat" title="Загрузить справочник артикул → базовое название (xlsx/csv)">Справочник…</button>
     <input type="file" id="catFile" accept=".xlsx,.xls,.csv,.txt" style="display:none">
-    <button id="btnGh" title="Скачать и установить свежую версию из GitHub">Обновить с GitHub</button>
     <span class="hint">Ctrl+V — вставка (можно только артикулы: названия подтянутся из справочника) · Ctrl+C — копия · двойной клик — правка</span>
   </div>
   <table id="tbl">
