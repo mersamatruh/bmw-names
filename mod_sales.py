@@ -364,7 +364,7 @@ def register(ctx):
     SECTION_HTML = """
   <h2 style="margin:0 0 4px">📈 Анализ продаж</h2>
   <p class="hint" style="margin:0 0 14px">Анализатор продаж Porsche (пробная версия).
-    Вносите позиции или вставляйте столбцы из Excel вместе с заголовком (Ctrl+V в ячейку первой строки) — заголовок отбросится. Блок ячеек выделяется мышкой или Shift+клик: Ctrl+C — копия, Delete — очистка. Всё
+    Вносите позиции или вставляйте столбцы из Excel вместе с заголовком (Ctrl+V в ячейку первой строки) — заголовок отбросится. Блок ячеек выделяется мышкой или Shift+клик, весь столбец — кликом по заголовку; сортировка — значок ⇅: Ctrl+C — копия, Delete — очистка. Всё
     сохраняется на сервере автоматически.</p>
   <div class="bar">
     <button onclick="slNew()">Новая партия</button>
@@ -436,11 +436,15 @@ def register(ctx):
   #slWrap{overflow:auto;max-height:calc(100vh - 230px);border:1px solid var(--line);
           border-radius:8px}
   #slTable{border:none;border-radius:0;min-width:1500px}
+  #slTable{overflow:visible}  /* overflow:hidden у общей таблицы ломает закрепление шапки */
   #slTable thead{position:sticky;top:0;z-index:2}
+  #slTable tr.ttl th{user-select:none}
+  #slTable th.csel{background:#dbe7fb}
+  #slTable th .ar{cursor:pointer;padding:0 2px}
+  #slTable th .ar.dim{color:#b8c0cc}
   #slTable th{background:var(--panel);white-space:normal;vertical-align:bottom;
               font-size:11px;line-height:1.25}
   #slTable th.srt{cursor:pointer}
-  #slTable th.srt:hover{color:var(--blue)}
   #slTable th .ar{color:var(--blue);font-size:12px}
   #slTable tr.flt th{padding:3px 4px;background:#f7f9fb;border-bottom:2px solid var(--line)}
   #slTable tr.flt input,#slTable tr.flt select{width:100%;box-sizing:border-box;padding:3px 5px;
@@ -650,7 +654,8 @@ function slHead(){
   var t=document.getElementById('slTable');
   if(!t.tHead.rows.length){
     var h='<tr class="ttl">'; SL_COLS.forEach(function(c){
-      h+='<th class="'+c.ty+' srt" data-k="'+c.k+'" title="Нажмите для сортировки">'+c.t+' <span class="ar"></span></th>';});
+      h+='<th class="'+c.ty+' srt" data-k="'+c.k+'" title="Клик — выделить весь столбец (Shift+клик — несколько столбцов); ⇅ — сортировка">'+c.t
+        +' <span class="ar" title="Сортировка">⇅</span></th>';});
     h+='<th></th></tr><tr class="flt">';
     SL_COLS.forEach(function(c){
       if(c.ty==='status') h+='<th><select data-f="status"><option value="">все</option><option>✓</option><option>✎</option></select></th>';
@@ -662,7 +667,8 @@ function slHead(){
   }
   t.tHead.querySelectorAll('tr.ttl th[data-k]').forEach(function(th){
     var k=th.dataset.k, ar=th.querySelector('.ar');
-    ar.textContent=(SL.sort&&SL.sort.k===k)?(SL.sort.dir>0?'▲':'▼'):''; });
+    var on=SL.sort&&SL.sort.k===k; ar.textContent=on?(SL.sort.dir>0?'▲':'▼'):'⇅';
+    ar.classList.toggle('dim', !on); });
   t.tHead.querySelectorAll('tr.flt [data-f]').forEach(function(el){
     var v=SL.colf[el.dataset.f]||''; if(el.value!==v) el.value=v; el.classList.toggle('on', !!v); });
 }
@@ -691,8 +697,17 @@ function slResetOrder(){
 }
 document.addEventListener('click', function(e){
   var th=e.target.closest && e.target.closest('#slTable tr.ttl th[data-k]');
-  if(th) slSortBy(th.dataset.k);
+  if(!th) return;
+  if(e.target.closest('.ar')){ slSortBy(th.dataset.k); return; }
+  slSelCol(SL_COLS.findIndex(function(c){return c.k===th.dataset.k;}), e.shiftKey);
 });
+/* клик по заголовку — выделить весь столбец (видимые строки), как в Excel */
+function slSelCol(c, extend){
+  var n=document.querySelectorAll('#slTable tbody tr').length; if(c<0 || !n) return;
+  if(document.activeElement && document.activeElement.blur) document.activeElement.blur();
+  var a=(extend && SL.sel && SL.sel.col)?SL.sel.a:{r:0,c:c};
+  SL.sel={a:a, b:{r:n-1,c:c}, col:true}; slSelPaint();
+}
 document.addEventListener('input', function(e){
   var el=e.target; if(!el.closest || !el.closest('#slTable tr.flt') || !el.dataset.f) return;
   SL.colf[el.dataset.f]=el.value.trim(); el.classList.toggle('on', !!el.value.trim());
@@ -917,7 +932,10 @@ function slSelBox(){ var a=SL.sel.a, b=SL.sel.b;
   return {r1:Math.min(a.r,b.r), r2:Math.max(a.r,b.r), c1:Math.min(a.c,b.c), c2:Math.min(Math.max(a.c,b.c), SL_COLS.length-1)}; }
 function slSelPaint(){
   document.querySelectorAll('#slTable td.sel').forEach(function(td){ td.classList.remove('sel'); });
+  document.querySelectorAll('#slTable th.csel').forEach(function(th){ th.classList.remove('csel'); });
   if(!SL.sel) return;
+  if(SL.sel.col){ var hb=slSelBox(), ths=document.querySelectorAll('#slTable tr.ttl th');
+    for(var hc=hb.c1;hc<=hb.c2;hc++) if(ths[hc]) ths[hc].classList.add('csel'); }
   var b=slSelBox(), trs=document.querySelectorAll('#slTable tbody tr');
   for(var r=b.r1;r<=b.r2;r++){ var tr=trs[r]; if(!tr) continue;
     for(var c=b.c1;c<=b.c2;c++) if(tr.children[c]) tr.children[c].classList.add('sel'); }
@@ -927,7 +945,7 @@ function slSelMulti(){ if(!SL.sel) return false; var b=slSelBox(); return b.r1!=
 document.addEventListener('mousedown', function(e){
   var td=e.target.closest && e.target.closest('#slTable tbody td');
   if(!td || td.classList.contains('del')){
-    if(!(e.target.closest&&e.target.closest('#slTable tbody'))) slSelClear(); return; }
+    if(!(e.target.closest&&e.target.closest('#slTable tbody, #slTable tr.ttl'))) slSelClear(); return; }
   var pos=slCellPos(td);
   if(e.shiftKey){
     var a=SL.sel?SL.sel.a:null;
