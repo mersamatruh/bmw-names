@@ -204,7 +204,8 @@ def register(ctx):
 """
 
     CSS = """
-  #slWrap{overflow:auto;max-height:calc(100vh - 260px);border:1px solid var(--line);
+  #sec-sales{max-width:none;margin:18px 0}
+  #slWrap{overflow:auto;max-height:calc(100vh - 230px);border:1px solid var(--line);
           border-radius:8px}
   #slTable{border:none;border-radius:0;min-width:1500px}
   #slTable th{position:sticky;top:0;background:var(--panel);z-index:1;
