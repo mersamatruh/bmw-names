@@ -478,6 +478,7 @@ def register(ctx):
       <input id="slCover" class="slnum" type="number" min="1"></label>
     <input id="slSearch" placeholder="Поиск по артикулу или названию">
     <button onclick="slAddRow()">+ Строка</button>
+    <button id="slAiAll" onclick="slAiRecalc()" title="Пересчитать ИИ по правилам методички все строки со статусом «Требует проверки». Одобренные и скорректированные не трогаются. Платный запрос к ИИ.">🤖 Пересчитать все</button>
     <button onclick="slResetOrder()" title="Снять фильтры и сортировку, выстроить строки по № от 1">↺ Вернуть исходный порядок</button>
     <button onclick="slExport()">⬇️ Скачать CSV</button>
     <button onclick="document.getElementById('slCatXls').click()"
@@ -526,7 +527,8 @@ def register(ctx):
     увидеть расчёт. Статус: «Требует проверки» — число посчитал ИИ; ✓ — количество верное,
     статус «Одобрено» (без комментария); ✎ или правка числа — спросим причину, статус
     «Скорректировано». Одобрения и правки копятся в методичке; кнопка ↻ в колонке «Статус»
-    (справа от ✎) пересчитывает ИИ именно эту строку по правилам методички (такое число помечено
+    (справа от ✎) пересчитывает ИИ именно эту строку по правилам методички, «🤖 Пересчитать все» —
+    все строки «Требует проверки» (такое число помечено
     🤖, наведите — увидите причину; если цифры строки поменяются, вернётся формула).</p>
 """
 
@@ -694,6 +696,38 @@ function slAiSig(r){
   return ['profit','turn_de','sold_de','sold_sup','sold_stock','stock','ordered','transit','year']
     .map(function(k){ return r[k]==null?'':r[k]; })
     .concat([slPeriodDays()||SL.settings.period_days||90, SL.settings.cover_days||60]).join('|');
+}
+/* «Пересчитать все»: непроверенные строки пачками по 40 */
+async function slAiRecalc(){
+  var idx=[]; SL.rows.forEach(function(r,i){
+    if(r.art && r.order_manual==null && slStatus(r)==='Требует проверки') idx.push(i); });   // пустые строки без цифр не трогаем
+  if(!idx.length){ alert('Нет непроверенных строк — все одобрены или исправлены.'); return; }
+  if(!SL.lessons){ alert('Методичка пуста. Сначала одобрите ✓ или исправьте ✎ несколько строк — из них ИИ выведет правила.'); return; }
+  if(!confirm('Пересчитать «В заказ» для '+idx.length+' непроверенных строк по правилам из методички ('
+    +SL.lessons+' зап.)?\nОдобренные и скорректированные строки не трогаются. Это платный запрос к ИИ.')) return;
+  var btn=document.getElementById('slAiAll'), msg=document.getElementById('slSaved'), done=0, changed=0;
+  btn.disabled=true;
+  try{
+    for(var k=0;k<idx.length;k+=40){
+      var part=idx.slice(k,k+40);
+      msg.textContent='🤖 ИИ считает: '+done+' из '+idx.length+'…';
+      var rows=part.map(function(i){ var r=SL.rows[i], o=slOrder(r);
+        return {i:i, art:r.art, repl:r.repl, name:slName(r), profit:r.profit, turn_de:r.turn_de,
+          sold_de:r.sold_de, sold_sup:r.sold_sup, sold_stock:r.sold_stock, total:slTotal(r),
+          stock:r.stock, ordered:r.ordered, transit:r.transit, year:r.year, calc:o.ai?o.fq:o.q}; });
+      var res=await api('/api/sales_ai',{rows:rows, period_days:slPeriodDays()||SL.settings.period_days||90,
+        cover_days:SL.settings.cover_days||60});
+      if(!res || res.error){ alert(res&&res.error||'Ошибка ИИ'); break; }
+      (res.results||[]).forEach(function(x){ var i=+x.i, r=SL.rows[i]; if(!r) return;
+        var before=slOrderVal(r);
+        r.order_ai=x.q; r.order_ai_why=x.why; r.order_ai_sig=slAiSig(r);
+        if(slOrderVal(r)!==before) changed++;
+        slRefreshRow(i, true); });
+      done+=part.length;
+    }
+  } finally { btn.disabled=false; }
+  slStCount(); slSave();
+  setTimeout(function(){ msg.textContent='🤖 Пересчитано строк: '+done+', изменилось: '+changed; }, 1200);
 }
 /* кнопка ↻ в ячейке «В заказ»: пересчитать ИИ по методичке только эту строку */
 async function slAiOne(i, btn){
