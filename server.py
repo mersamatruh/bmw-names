@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "3.0 от 15.10.2026"
+VERSION = "3.1 от 15.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -881,7 +881,7 @@ PAGE = r"""<!doctype html>
 <body>
 <header>
   <h1>Каталог BMW · генератор наименований</h1>
-  <span class="sub">эталонов в базе: <b id="refcount">—</b> · справочник: <b id="catcount">—</b> · расход: <b id="spend">—</b> · версия {{ version }}</span>
+  <span class="sub">эталонов в базе: <b id="refcount">—</b> · справочник: <b id="catcount">—</b> · расход: <b id="spend">—</b> · версия {{ version }}{{ published }}</span>
 </header>
 <div class="layout">
   <nav class="side">
@@ -1611,6 +1611,15 @@ def index():
     page = page.replace("{{ need_pw }}", "true" if APP_PASSWORD else "false")
     page = page.replace("{{ refcount }}", str(len(REFS)))
     page = page.replace("{{ version }}", VERSION)
+    # время публикации версии = момент записи server.py на сервере (по Москве)
+    try:
+        import zoneinfo
+        ts = os.path.getmtime(os.path.join(HERE, "server.py"))
+        t = datetime.datetime.fromtimestamp(ts, zoneinfo.ZoneInfo("Europe/Moscow"))
+        published = f" в {t.strftime('%H:%M')}"
+    except Exception:
+        published = ""
+    page = page.replace("{{ published }}", published)
     return Response(page, mimetype="text/html")
 
 
