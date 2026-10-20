@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "4.80 от 15.10.2026"
+VERSION = "4.81 от 20.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -785,6 +785,7 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Каталог BMW — генератор наименований</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
   :root{
     --bg:#f4f6f8; --panel:#ffffff; --ink:#171a1f; --mut:#6b7280;
@@ -1596,6 +1597,17 @@ def _load_modules():
 
 
 _load_modules()
+
+
+# Иконка сайта (вкладка и закладки): оранжевый квадрат с белой «К» — заметна среди закладок
+FAVICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#ff6a00"/><text x="32" y="47" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" font-size="44" font-weight="900" fill="#fff">К</text></svg>'''
+
+
+@app.get("/favicon.svg")
+@app.get("/favicon.ico")
+def favicon():
+    return app.response_class(FAVICON_SVG, mimetype="image/svg+xml",
+                              headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/")
