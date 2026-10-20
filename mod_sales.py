@@ -632,7 +632,7 @@ def register(ctx):
     SECTION_HTML = """
   <h2 style="margin:0 0 4px">📈 Анализ продаж</h2>
   <p class="hint" style="margin:0 0 14px">Анализатор продаж Porsche (пробная версия).
-    Вносите позиции или вставляйте столбцы из Excel вместе с заголовком (Ctrl+V в ячейку первой строки) — заголовок отбросится. Блок ячеек выделяется мышкой или Shift+клик, весь столбец — кликом по заголовку, переставить столбец — потянуть заголовок мышкой; сортировка — значок ⇅: Ctrl+C — копия, Delete — очистка. Всё
+    Вносите позиции или вставляйте столбцы из Excel вместе с заголовком (Ctrl+V в ячейку первой строки) — заголовок отбросится. Блок ячеек выделяется мышкой или Shift+клик, весь столбец — кликом по заголовку, переставить столбец — потянуть заголовок мышкой, ширина — потянуть правый край заголовка; сортировка — значок ⇅: Ctrl+C — копия, Delete — очистка. Всё
     сохраняется на сервере автоматически.</p>
   <div class="bar">
     <button onclick="slNew()">Новая партия</button>
@@ -654,7 +654,7 @@ def register(ctx):
     <button id="slAiAll" onclick="slAiRecalc()" title="Пересчитать ИИ по правилам методички все строки со статусом «Требует проверки». Одобренные и скорректированные не трогаются. Платный запрос к ИИ.">🤖 Пересчитать все</button>
     <button id="slNmAll" onclick="slNameAll()" title="Найти русские названия для всех строк, где названия нет или оно не на русском. ИИ ищет деталь в интернете. Платный запрос.">🔍 Русские названия</button>
     <button onclick="slResetOrder()" title="Снять фильтры и сортировку, выстроить строки по № от 1">↺ Вернуть исходный порядок</button>
-    <button id="slColReset" onclick="slColReset()" title="Вернуть столбцы на их обычные места" style="display:none">⇆ Столбцы по умолчанию</button>
+    <button id="slColReset" onclick="slColReset()" title="Вернуть столбцы на их обычные места и обычную ширину" style="display:none">⇆ Столбцы по умолчанию</button>
     <button onclick="slExport()">⬇️ Скачать CSV</button>
     <button onclick="document.getElementById('slCatXls').click()"
             title="Excel-файл: столбец A — артикул, столбец B — наименование">📥 Загрузить справочник (Excel)</button>
@@ -734,8 +734,11 @@ def register(ctx):
   #slTable tr.ttl th{user-select:none}
   #slTable th.csel{background:#dbe7fb}
   #slTable tr.ttl th{position:relative}
-  #slTable tr.ttl th{padding-right:26px}
-  #slTable th .ar{cursor:pointer;position:absolute;top:3px;right:3px;width:20px;height:26px;
+  #slTable tr.ttl th{padding-right:30px;overflow-wrap:anywhere}
+  #slTable th .rz{position:absolute;top:0;right:-3px;width:7px;height:100%;cursor:col-resize;z-index:3}
+  #slTable th .rz:hover,#slTable th .rz.on{background:var(--blue);opacity:.45}
+  body.slrz,body.slrz *{cursor:col-resize!important;user-select:none!important}
+  #slTable th .ar{cursor:pointer;position:absolute;top:3px;right:6px;width:20px;height:26px;
         display:flex;flex-direction:column;align-items:center;justify-content:center;
         border-radius:5px;line-height:1}
   #slTable th .ar i{font-style:normal;font-size:11px;color:#c3cad5;height:11px}
@@ -1121,10 +1124,12 @@ function slEnsureN(){
 }
 function slHead(){
   var t=document.getElementById('slTable');
+  slColWPaint();
   if(!t.tHead.rows.length){
     var h='<tr class="ttl">'; SL_COLS.forEach(function(c){
-      h+='<th class="'+c.ty+' srt" data-k="'+c.k+'" title="Клик — выделить весь столбец (Shift+клик — несколько столбцов); ⇅ — сортировка; потянуть мышкой — переставить столбец">'+c.t
-        +' <span class="ar" title="Сортировка: ▲ по возрастанию, ▼ по убыванию"><i class="u">▲</i><i class="d">▼</i></span></th>';});
+      h+='<th class="'+c.ty+' srt" data-k="'+c.k+'" title="Клик — выделить весь столбец (Shift+клик — несколько столбцов); ⇅ — сортировка; потянуть мышкой — переставить столбец; потянуть правый край — ширина">'+c.t
+        +' <span class="ar" title="Сортировка: ▲ по возрастанию, ▼ по убыванию"><i class="u">▲</i><i class="d">▼</i></span>'
+        +'<span class="rz" title="Потяните — изменить ширину столбца; двойной клик — обычная ширина"></span></th>';});
     h+='<th></th></tr><tr class="flt">';
     SL_COLS.forEach(function(c){
       if(c.ty==='status') h+='<th><select data-f="status"><option value="">все</option>'
@@ -1177,17 +1182,63 @@ function slColApply(keys){
     out.splice(at,0,by[k]); delete by[k]; });
   SL_COLS.length=0; out.forEach(function(c){ SL_COLS.push(c); });
   slPasteCols();
-  var b=document.getElementById('slColReset');
-  if(b) b.style.display=SL_COLS.map(function(c){return c.k;}).join()===SL_COLS_DEF.join()?'none':'';
+  slColResetBtn();
 }
+function slColResetBtn(){
+  var b=document.getElementById('slColReset'); if(!b) return;
+  var same=SL_COLS.map(function(c){return c.k;}).join()===SL_COLS_DEF.join() && !Object.keys(SL_COLW).length;
+  b.style.display=same?'none':'';
+}
+/* ---------- ширина столбцов: потянуть правый край заголовка ----------
+   ширины запоминаются в этом браузере (localStorage 'slColW' = {ключ: px}) */
+var SL_COLW={};
+try{ SL_COLW=JSON.parse(localStorage.getItem('slColW')||'{}')||{}; }catch(e){ SL_COLW={}; }
+function slColWSave(){ try{ if(Object.keys(SL_COLW).length) localStorage.setItem('slColW', JSON.stringify(SL_COLW));
+  else localStorage.removeItem('slColW'); }catch(e){} slColResetBtn(); }
+function slColWPaint(){
+  var st=document.getElementById('slColWStyle');
+  if(!st){ st=document.createElement('style'); st.id='slColWStyle'; document.head.appendChild(st); }
+  var css='';
+  SL_COLS.forEach(function(c,ci){ var w=SL_COLW[c.k]; if(!w) return;
+    var sel='#slTable tr>:nth-child('+(ci+1)+')';
+    css+=sel+'{width:'+w+'px;min-width:'+w+'px;max-width:'+w+'px;overflow:hidden}'
+      +'#slTable tr.ttl>:nth-child('+(ci+1)+'){overflow:visible}'; });
+  st.textContent=css;
+}
+SL.rz=null;
+document.addEventListener('mousedown', function(e){
+  var h=e.button===0 && e.target.classList && e.target.classList.contains('rz') && e.target;
+  if(!h) return;
+  e.preventDefault(); e.stopImmediatePropagation();
+  var th=h.closest('th');
+  SL.rz={k:th.dataset.k, x:e.clientX, w:th.getBoundingClientRect().width, h:h};
+  h.classList.add('on'); document.body.classList.add('slrz');
+}, true);
+document.addEventListener('mousemove', function(e){
+  if(!SL.rz) return;
+  if(!(e.buttons&1)){ slRzEnd(); return; }
+  SL_COLW[SL.rz.k]=Math.max(40, Math.round(SL.rz.w+e.clientX-SL.rz.x)); slColWPaint();
+}, true);
+function slRzEnd(){
+  if(!SL.rz) return;
+  SL.rz.h.classList.remove('on'); document.body.classList.remove('slrz');
+  SL.rz=null; slColWSave();
+  SL.colSkipClick=true; setTimeout(function(){ SL.colSkipClick=false; }, 0);
+}
+document.addEventListener('mouseup', function(){ slRzEnd(); }, true);
+document.addEventListener('dblclick', function(e){
+  if(!(e.target.classList && e.target.classList.contains('rz'))) return;
+  var k=e.target.closest('th').dataset.k; delete SL_COLW[k]; slColWPaint(); slColWSave();
+}, true);
 function slColSave(){ try{ localStorage.setItem('slColOrder', JSON.stringify(SL_COLS.map(function(c){return c.k;}))); }catch(e){} }
 function slColRebuild(){
   var t=document.getElementById('slTable'); t.tHead.innerHTML='';
   slSelClear(); slRender();
 }
-function slColReset(){ slColApply(SL_COLS_DEF); try{ localStorage.removeItem('slColOrder'); }catch(e){} slColRebuild(); }
+function slColReset(){ SL_COLW={}; slColWSave(); slColApply(SL_COLS_DEF); try{ localStorage.removeItem('slColOrder'); }catch(e){} slColRebuild(); }
 (function(){ var k=null; try{ k=JSON.parse(localStorage.getItem('slColOrder')||'null'); }catch(e){}
   if(Array.isArray(k)) slColApply(k); })();
+slColResetBtn();
 SL.cdrag=null;
 document.addEventListener('mousedown', function(e){
   var th=e.button===0 && e.target.closest && e.target.closest('#slTable tr.ttl th[data-k]');
