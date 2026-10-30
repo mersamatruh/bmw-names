@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "5.1 от 30.10.2026"
+VERSION = "5.11 от 30.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -1127,12 +1127,12 @@ PAGE = r"""<!doctype html>
     </tr>
     <tr class="fltrow">
       <td></td>
-      <td><input data-flt="art" placeholder="фильтр…"></td>
-      <td><input data-flt="short" placeholder="фильтр…"></td>
-      <td><input data-flt="base" placeholder="фильтр…"></td>
-      <td class="hide-m"><input data-flt="models" placeholder="фильтр…"></td>
-      <td><input data-flt="name" placeholder="фильтр…"></td>
-      <td><input data-flt="weight" placeholder="фильтр…"></td>
+      <td><input autocomplete="off" spellcheck="false" data-flt="art" placeholder="фильтр…"></td>
+      <td><input autocomplete="off" spellcheck="false" data-flt="short" placeholder="фильтр…"></td>
+      <td><input autocomplete="off" spellcheck="false" data-flt="base" placeholder="фильтр…"></td>
+      <td class="hide-m"><input autocomplete="off" spellcheck="false" data-flt="models" placeholder="фильтр…"></td>
+      <td><input autocomplete="off" spellcheck="false" data-flt="name" placeholder="фильтр…"></td>
+      <td><input autocomplete="off" spellcheck="false" data-flt="weight" placeholder="фильтр…"></td>
       <td></td>
       <td><select data-flt="status">
         <option value="">— все —</option>
@@ -1260,6 +1260,14 @@ document.querySelectorAll('[data-flt]').forEach(el=>{
     applyFilters();
   });
 });
+// страховка от автозаполнения браузера: при загрузке фильтры всегда пустые
+setTimeout(()=>{
+  let dirty=false;
+  document.querySelectorAll('[data-flt]').forEach(el=>{
+    if(el.value){el.value=''; dirty=true;}
+  });
+  if(dirty){Object.keys(filters).forEach(k=>filters[k]=''); applyFilters();}
+}, 300);
 document.getElementById('fltClear').onclick=()=>{
   document.querySelectorAll('[data-flt]').forEach(el=>{el.value='';});
   Object.keys(filters).forEach(k=>filters[k]='');
