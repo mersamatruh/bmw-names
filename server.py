@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "5.12 от 30.10.2026"
+VERSION = "5.13 от 30.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -1587,8 +1587,11 @@ function flushPending(){
 function startPoll(){
   stopPoll(); setRunning(true);
   pollTimer=setInterval(async()=>{
+    const sid=jobId;
+    if(!sid){stopPoll();setRunning(false);return;}
     try{
-      const d=await apiGet('/api/job?id='+encodeURIComponent(jobId));
+      const d=await apiGet('/api/job?id='+encodeURIComponent(sid));
+      if(sid!==jobId) return;  // пока ждали ответ, открыли другой слепок или новую партию
       if(d.error){stopPoll();setRunning(false);return;}
       mergeRows(d.rows);
       updateCosts();
@@ -1762,7 +1765,7 @@ async function init(){
 }
 
 $('#btnAdd').onclick=()=>{rows.push(emptyRow());render();};
-$('#btnClear').onclick=()=>{if(confirm('Начать новую партию? Текущая таблица очистится (слепки сохраняются).')){rows=[emptyRow()];jobId=null;stopPoll();setRunning(false);render();refreshSnaps();}};
+$('#btnClear').onclick=()=>{if(confirm('Начать новую партию? Таблица очистится; слепки сохраняются, а запущенная генерация по текущему слепку продолжится в фоне.')){rows=[emptyRow()];jobId=null;stopPoll();setRunning(false);render();refreshSnaps();}};
 $('#btnCopyRes').onclick=()=>{
   const lines=rows.filter(r=>(r.art||'').trim())
                   .map(r=>(r.art||'')+'\t'+(r.name||''));
