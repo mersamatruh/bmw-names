@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "5.13 от 30.10.2026"
+VERSION = "5.14 от 30.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -1156,7 +1156,11 @@ PAGE = r"""<!doctype html>
 <div id="login" style="display:none">
   <div class="box">
     <b>Вход</b>
-    <input id="pw" type="password" placeholder="Пароль" autofocus>
+    <!-- скрытое поле логина: Chrome кладёт сохранённое имя пользователя сюда,
+         а не в первое попавшееся поле фильтра таблицы -->
+    <input type="text" name="username" autocomplete="username" tabindex="-1"
+           aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0">
+    <input id="pw" type="password" name="password" autocomplete="current-password" placeholder="Пароль" autofocus>
     <button class="primary" style="width:100%" onclick="doLogin()">Войти</button>
   </div>
 </div>
