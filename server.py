@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify, Response
 import generate_names as gn  # переиспользуем логику подбора примеров и промпта
 import anthropic
 
-VERSION = "5.0 от 30.10.2026"
+VERSION = "5.1 от 30.10.2026"
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -176,6 +176,104 @@ def save_catalog():
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(CATALOG, f, ensure_ascii=False)
     os.replace(tmp, CATALOG_PATH)
+
+
+WEIGHTS_PATH = "weights.json"
+
+
+def load_weights():
+    if not os.path.exists(WEIGHTS_PATH):
+        return {}
+    try:
+        with open(WEIGHTS_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return {}
+    out = {}
+    for k, v in raw.items():
+        try:
+            out[norm_art_key(k)] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+WEIGHTS = load_weights()
+print(f"Справочник весов: {len(WEIGHTS)} позиций.")
+
+
+def save_weights():
+    tmp = WEIGHTS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(WEIGHTS, f, ensure_ascii=False)
+    os.replace(tmp, WEIGHTS_PATH)
+
+
+def fmt_weight(w):
+    """0.5, 12.35, 7 — без лишних нулей."""
+    s = f"{float(w):.3f}".rstrip("0").rstrip(".")
+    return s or "0"
+
+
+@app.post("/api/weights_upload")
+def weights_upload():
+    """Excel/CSV: первый столбец — артикул, второй — вес в кг."""
+    if not check_auth(request):
+        return jsonify({"error": "Неверный пароль"}), 401
+    f = request.files.get("file")
+    if f is None:
+        return jsonify({"error": "Файл не получен"}), 400
+    import pandas as pd, io
+    fn = (f.filename or "").lower()
+    try:
+        data = f.read()
+        if fn.endswith(".csv") or fn.endswith(".txt"):
+            df = pd.read_csv(io.BytesIO(data), sep=None, engine="python",
+                             dtype=str, encoding="utf-8-sig")
+        else:
+            df = pd.read_excel(io.BytesIO(data), dtype=str)
+    except Exception as e:
+        return jsonify({"error": f"Не удалось прочитать файл: {e}"}), 400
+
+    # столбцы: по заголовкам («артикул», «вес»), иначе первые два непустых
+    art_col = w_col = None
+    for c in df.columns:
+        n = str(c).strip().lower()
+        if art_col is None and ("артикул" in n or "article" in n or n in ("art", "номер")):
+            art_col = c
+        elif w_col is None and ("вес" in n or "weight" in n or "кг" in n or n == "kg"):
+            w_col = c
+    if art_col is None or w_col is None:
+        cols = [c for c in df.columns if df[c].notna().any()]
+        if len(cols) < 2:
+            return jsonify({"error": "Нужны 2 столбца: артикул и вес (кг)"}), 400
+        art_col, w_col = cols[0], cols[1]
+
+    added = updated = skipped = 0
+    with lock:
+        for _, row in df.iterrows():
+            art = norm_art_key(row.get(art_col, ""))
+            wraw = str(row.get(w_col, "") or "").strip().replace(",", ".")
+            wraw = re.sub(r"[^0-9.]", "", wraw)
+            if not art or art == "NAN" or not wraw:
+                skipped += 1
+                continue
+            try:
+                w = float(wraw)
+            except ValueError:
+                skipped += 1
+                continue
+            if not (0 < w < 5000):
+                skipped += 1
+                continue
+            if art in WEIGHTS:
+                updated += 1
+            else:
+                added += 1
+            WEIGHTS[art] = round(w, 3)
+        save_weights()
+    return jsonify({"ok": True, "added": added, "updated": updated,
+                    "skipped": skipped, "total": len(WEIGHTS)})
 
 
 @app.post("/api/catalog_upload")
@@ -381,6 +479,7 @@ def clean_rows(raw):
             "gen0": str(r.get("gen0", "")).strip(),
             "why": str(r.get("why", "")).strip(),
             "seo": str(r.get("seo", "")),
+            "weight": str(r.get("weight", "")).strip(),
             "status": st,
         })
     return rows
@@ -417,6 +516,8 @@ def api_resume():
         return jsonify({"error": "Слепок не найден"}), 404
     if job["running"]:
         return jsonify({"id": sid})
+    if job.get("seo_running") or job.get("w_running"):
+        return jsonify({"error": "Дождитесь окончания текущей генерации"}), 409
     if d.get("rows"):
         job["rows"] = clean_rows(d["rows"])
     save_job(sid)
@@ -433,7 +534,8 @@ def api_job():
     if job is None:
         return jsonify({"error": "Слепок не найден"}), 404
     return jsonify({"id": sid, "rows": job["rows"], "running": job["running"],
-                    "seo_running": job.get("seo_running", False)})
+                    "seo_running": job.get("seo_running", False),
+                    "w_running": job.get("w_running", False)})
 
 
 @app.post("/api/stop")
@@ -523,7 +625,7 @@ def api_seo_start():
     job = load_job(sid)
     if job is None:
         return jsonify({"error": "Слепок не найден"}), 404
-    if job.get("running") or job.get("seo_running"):
+    if job.get("running") or job.get("seo_running") or job.get("w_running"):
         return jsonify({"error": "Дождитесь окончания текущей генерации"}), 409
     todo = sum(1 for r in job["rows"]
                if not str(r.get("seo", "")).strip()
@@ -534,6 +636,110 @@ def api_seo_start():
     job["seo_running"] = True
     job["stop"] = False
     threading.Thread(target=seo_worker, args=(sid,), daemon=True).start()
+    return jsonify({"id": sid, "todo": todo})
+
+
+def build_weight_prompt(art, base):
+    return f"""Найди массу (вес) одной оригинальной запчасти BMW.
+Артикул: {art}
+Название детали: {base or "неизвестно"}
+
+Используй web-поиск: интернет-магазины и каталоги запчастей часто указывают вес
+("вес", "Gewicht", "weight"). Хорошие запросы: "{art} вес", "{art} Gewicht",
+"{art} weight". Нужен вес самой детали в килограммах (не брутто с упаковкой,
+если есть выбор). Если источники расходятся — возьми наиболее правдоподобный
+для такой детали.
+
+Ответь строго JSON без пояснений:
+{{"вес_кг": <число>}} — если вес найден,
+{{"вес_кг": null}} — если найти не удалось."""
+
+
+def weights_worker(sid):
+    job = JOBS[sid]
+    try:
+        for r in job["rows"]:
+            if job["stop"]:
+                break
+            art = str(r.get("art", "")).strip()
+            if not art:
+                continue
+            k = norm_art_key(art)
+            # базовое название и применимость — из справочника, чтобы строка была заполнена
+            if not str(r.get("base", "")).strip():
+                rec = CATALOG.get(k)
+                if rec:
+                    r["base"] = rec["base"]
+                    if not str(r.get("models", "")).strip() and rec.get("models"):
+                        r["models"] = rec["models"]
+                    save_job(sid)
+            cur = str(r.get("weight", "")).strip()
+            if cur and cur != "?":
+                continue
+            w = WEIGHTS.get(k)
+            if w is not None:
+                r["weight"] = fmt_weight(w)
+                save_job(sid)
+                continue
+            try:
+                msg = client.messages.create(
+                    model=gn.MODEL, max_tokens=800,
+                    messages=[{"role": "user",
+                               "content": build_weight_prompt(art, r.get("base", ""))}],
+                    tools=[{"type": "web_search_20250305", "name": "web_search",
+                            "max_uses": 3}],
+                )
+                add_cost(msg)
+                txt = gn.extract_text(msg)
+                m = re.search(r'"вес_кг"\s*:\s*([0-9]+(?:[.,][0-9]+)?)', txt)
+                if m:
+                    w = float(m.group(1).replace(",", "."))
+                    if 0 < w < 5000:
+                        r["weight"] = fmt_weight(w)
+                        with lock:
+                            WEIGHTS[k] = round(w, 3)
+                            save_weights()
+                    else:
+                        r["weight"] = "?"
+                else:
+                    r["weight"] = "?"
+            except Exception:
+                r["weight"] = "?"
+            save_job(sid)
+    finally:
+        job["w_running"] = False
+        save_job(sid)
+
+
+@app.post("/api/weights_start")
+def api_weights_start():
+    """Проставить веса: справочник весов, затем поиск по открытым источникам."""
+    if not check_auth(request):
+        return jsonify({"error": "Неверный пароль"}), 401
+    d = request.get_json(force=True)
+    sid = str(d.get("id", ""))
+    if sid:
+        job = load_job(sid)
+        if job is None:
+            return jsonify({"error": "Слепок не найден"}), 404
+        if job.get("running") or job.get("seo_running") or job.get("w_running"):
+            return jsonify({"error": "Дождитесь окончания текущей генерации"}), 409
+        if d.get("rows"):
+            job["rows"] = clean_rows(d["rows"])
+    else:
+        sid = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        JOBS[sid] = {"rows": clean_rows(d.get("rows", [])), "running": False, "stop": False}
+        job = JOBS[sid]
+    todo = sum(1 for r in job["rows"]
+               if str(r.get("art", "")).strip()
+               and (not str(r.get("weight", "")).strip()
+                    or str(r.get("weight", "")).strip() == "?"))
+    if not todo:
+        return jsonify({"error": "Нет строк для весов: нужны артикулы без веса"}), 400
+    job["w_running"] = True
+    job["stop"] = False
+    save_job(sid)
+    threading.Thread(target=weights_worker, args=(sid,), daemon=True).start()
     return jsonify({"id": sid, "todo": todo})
 
 
@@ -625,7 +831,7 @@ def api_snap_delete():
     job = load_job(sid)
     if job is None:
         return jsonify({"error": "Слепок не найден"}), 404
-    if job.get("running") or job.get("seo_running"):
+    if job.get("running") or job.get("seo_running") or job.get("w_running"):
         return jsonify({"error": "По этому слепку идёт генерация — сначала нажмите «Стоп»"}), 409
     with lock:
         JOBS.pop(sid, None)
@@ -898,6 +1104,7 @@ PAGE = r"""<!doctype html>
     <button id="btnAdd" style="display:none">Добавить строку</button>
     <button id="btnStop" style="display:none">Стоп</button>
     <button id="btnSeo" title="Сгенерировать SEO-описания для готовых строк без описания">Сгенерировать SEO</button>
+    <button id="btnW" title="Найти вес деталей: сначала справочник весов, затем открытые источники">Проставить веса</button>
     <button id="btnCopyRes" title="Скопировать артикулы и наименования для вставки в Excel">Скопировать результат</button>
     <button id="btnCsv" style="display:none">Скачать CSV</button>
     <button id="btnClear">Новая партия</button>
@@ -907,12 +1114,15 @@ PAGE = r"""<!doctype html>
     <button id="btnDelSnap" title="Удалить выбранный слепок с сервера">Удалить</button>
     <button id="btnCat" title="Загрузить справочник артикул → базовое название (xlsx/csv)">Справочник…</button>
     <input type="file" id="catFile" accept=".xlsx,.xls,.csv,.txt" style="display:none">
+    <button id="btnWCat" title="Загрузить справочник весов (xlsx/csv: артикул, вес в кг)">Веса…</button>
+    <input type="file" id="wFile" accept=".xlsx,.xls,.csv,.txt" style="display:none">
     <span class="hint">Ctrl+V — вставка (можно только артикулы: названия подтянутся из справочника) · Ctrl+C — копия · двойной клик — правка</span>
   </div>
   <table id="tbl">
     <thead><tr>
       <th style="width:30px">№</th><th>Артикул</th><th title="Последние 7 символов — для ЕТК">Кратк.</th><th>Базовое название</th>
       <th class="hide-m">Применимость</th><th>Наименование</th>
+      <th style="width:70px" title="Вес детали, кг">Вес, кг</th>
       <th style="width:220px">SEO-описание</th><th style="width:90px">Статус</th><th style="width:150px">Действия</th>
     </tr>
     <tr class="fltrow">
@@ -922,6 +1132,7 @@ PAGE = r"""<!doctype html>
       <td><input data-flt="base" placeholder="фильтр…"></td>
       <td class="hide-m"><input data-flt="models" placeholder="фильтр…"></td>
       <td><input data-flt="name" placeholder="фильтр…"></td>
+      <td><input data-flt="weight" placeholder="фильтр…"></td>
       <td></td>
       <td><select data-flt="status">
         <option value="">— все —</option>
@@ -959,7 +1170,7 @@ function doLogin(){ AUTH=$('#pw').value; localStorage.setItem('auth',AUTH);
                     $('#login').style.display='none'; init(); }
 
 function emptyRow(){
-  return {art:'',base:'',models:'',name:'',why:'',status:'wait'};
+  return {art:'',base:'',models:'',name:'',weight:'',why:'',status:'wait'};
 }
 let rows=[emptyRow()];
 
@@ -981,6 +1192,7 @@ function rowHTML(r,i){
       <td class="hide-m" contenteditable data-f="models" data-i="${i}">${esc(r.models)}</td>
       <td class="name" data-f="name" data-i="${i}" title="Двойной клик — редактировать">${esc(r.name)}
         ${r.why&&r.status!=='err'?`<div class="why">${esc(r.why)}</div>`:''}</td>
+      <td class="art" contenteditable data-f="weight" data-i="${i}" title="Вес, кг (можно править)">${esc(r.weight||'')}</td>
       <td class="seocell${r._seoOpen?' open':''}" data-si="${i}" title="${r.seo?(r._seoOpen?'Клик по тексту — свернуть':'Клик — развернуть'):''}">${
         r.seo ? (r._seoOpen
           ? esc(r.seo)+`<br><button class="seocopy" onclick="copySeo(${i});event.stopPropagation()">Копировать</button>`
@@ -994,7 +1206,7 @@ function rowHTML(r,i){
 }
 function render(){
   const tb=$('#tb'); tb.innerHTML='';
-  if(!rows.length){tb.innerHTML='<tr class="empty"><td colspan="9">Вставьте строки из Excel или нажмите «Добавить строку»</td></tr>';return;}
+  if(!rows.length){tb.innerHTML='<tr class="empty"><td colspan="10">Вставьте строки из Excel или нажмите «Добавить строку»</td></tr>';return;}
   rows.forEach((r,i)=>{
     const tr=document.createElement('tr');
     tr.innerHTML=rowHTML(r,i);
@@ -1013,7 +1225,7 @@ function updateRow(i){
 }
 
 // ---- Фильтры ----
-const filters={art:'',short:'',base:'',models:'',name:'',status:''};
+const filters={art:'',short:'',base:'',models:'',name:'',weight:'',status:''};
 function rowVisible(r){
   if(r._pin) return true;   // строку только что правили — не прячем
   if(filters.status && r.status!==filters.status) return false;
@@ -1022,6 +1234,7 @@ function rowVisible(r){
   if(filters.base && !(r.base||'').toLowerCase().includes(filters.base)) return false;
   if(filters.models && !(r.models||'').toLowerCase().includes(filters.models)) return false;
   if(filters.name && !(r.name||'').toLowerCase().includes(filters.name)) return false;
+  if(filters.weight && !(r.weight||'').toLowerCase().includes(filters.weight)) return false;
   return true;
 }
 function applyFilters(){
@@ -1227,14 +1440,15 @@ document.addEventListener('keydown',e=>{
 });
 
 // Вставка из Excel: заполняем начиная с ячейки, куда вставили (как в Excel)
-const COLS=['art','short','base','models','name'];
+const COLS=['art','short','base','models','name','weight'];
 function cleanVal(col, v){
   // убрать управляющие и невидимые символы (из Excel/PDF часто тянутся)
   v=String(v).replace(/[\u0000-\u001f\u007f\u00a0\u00ad\u200b-\u200f\u2028\u2029\ufeff]/g,' ');
   if(col==='art') return v.toUpperCase().replace(/[^A-Z0-9]/g,'');  // артикул: строго A-Z 0-9
+  if(col==='weight') return v.replace(',','.').replace(/[^0-9.]/g,'');  // вес: только число
   return v.replace(/\s+/g,' ').trim();
 }
-const WRITE=['art','base','models','name'];   // 'short' вычисляется, в него не пишем
+const WRITE=['art','base','models','name','weight'];   // 'short' вычисляется, в него не пишем
 document.addEventListener('paste',e=>{
   if(e.target && e.target.classList && e.target.classList.contains('nameedit')) return;
   const t=(e.clipboardData||window.clipboardData).getData('text');
@@ -1320,7 +1534,7 @@ function setRunning(on){
 }
 function stopPoll(){ if(pollTimer){clearInterval(pollTimer);pollTimer=null;} }
 function rowKey(r){
-  return [r.art,r.base,r.models,r.name,r.why,r.status,r.seo||''].join('\u0001');
+  return [r.art,r.base,r.models,r.name,r.weight||'',r.why,r.status,r.seo||''].join('\u0001');
 }
 function mergeRows(srv){
   // структура изменилась (другое число строк) — только целиком, и не под редактором
@@ -1337,6 +1551,7 @@ function mergeRows(srv){
     if(lr && lr._dirty){
       const keepWait = lr.status==='wait' && sr.status==='err';
       next={...sr, art:lr.art, base:lr.base, models:lr.models,
+            weight: lr.weight || sr.weight,
             status: keepWait?'wait':sr.status,
             why: keepWait?'':sr.why, _dirty:true};
     } else {
@@ -1364,7 +1579,10 @@ function startPoll(){
       updateCosts();
       $('#btnSeo').disabled=!!d.seo_running;
       $('#btnSeo').textContent=d.seo_running?'Идёт SEO…':'Сгенерировать SEO';
-      if(!d.running && !d.seo_running){stopPoll();setRunning(false);refreshSnaps(jobId);}
+      $('#btnW').disabled=!!d.w_running||!!d.running;
+      $('#btnW').textContent=d.w_running?'Идёт поиск весов…':'Проставить веса';
+      if(d.w_running) $('#btnGen').disabled=true;
+      if(!d.running && !d.seo_running && !d.w_running){stopPoll();setRunning(false);refreshSnaps(jobId);}
     }catch(e){}
   },2000);
 }
@@ -1406,6 +1624,18 @@ $('#btnGen').onclick=async()=>{
   }catch(e){setRunning(false);}
 };
 $('#btnStop').onclick=async()=>{ if(jobId) await api('/api/stop',{id:jobId}); };
+$('#btnW').onclick=async()=>{
+  await fillFromCatalog();
+  const payload=rows.filter(r=>r.art||r.base);
+  if(!payload.length){alert('Таблица пуста — вставьте артикулы');return;}
+  const d= jobId ? await api('/api/weights_start',{id:jobId,rows:payload})
+                 : await api('/api/weights_start',{rows:payload});
+  if(d.error){alert(d.error);return;}
+  rows.forEach(r=>{delete r._dirty;});
+  jobId=d.id; refreshSnaps(jobId);
+  $('#btnW').disabled=true; $('#btnW').textContent='Идёт поиск весов…';
+  startPoll();
+};
 $('#btnSeo').onclick=async()=>{
   if(!jobId){alert('Сначала сгенерируйте названия — SEO делается по готовому слепку');return;}
   const d=await api('/api/seo_start',{id:jobId});
@@ -1471,6 +1701,16 @@ async function uploadCatalog(file){
   alert(`Справочник загружен: добавлено ${d.added}, обновлено ${d.updated}. Всего позиций: ${d.total}.`);
 }
 $('#btnCat').onclick=()=>$('#catFile').click();
+async function uploadWeights(file){
+  const fd=new FormData(); fd.append('file',file);
+  const res=await fetch('/api/weights_upload',{method:'POST',headers:{'X-Auth':AUTH},body:fd});
+  if(res.status===401){localStorage.removeItem('auth');AUTH='';$('#login').style.display='flex';return;}
+  const d=await res.json();
+  if(d.error){alert('Ошибка: '+d.error);return;}
+  alert(`Справочник весов: добавлено ${d.added}, обновлено ${d.updated}, пропущено ${d.skipped}. Всего весов: ${d.total}.`);
+}
+$('#btnWCat').onclick=()=>$('#wFile').click();
+$('#wFile').onchange=e=>{ if(e.target.files[0]){uploadWeights(e.target.files[0]); e.target.value='';} };
 $('#btnGh').onclick=async()=>{
   if(!confirm('Скачать свежую версию с GitHub и перезапустить сервер? Текущая сохранится как server.py.bak')) return;
   const d=await api('/api/update_github',{});
@@ -1522,8 +1762,8 @@ $('#btnCopyRes').onclick=()=>{
   setTimeout(()=>{b.textContent=t;},2000);
 };
 $('#btnCsv').onclick=()=>{
-  const head='Артикул;Краткий;Базовое;Применимость;Наименование;SEO-описание;Статус\n';
-  const body=rows.map(r=>[r.art,shortOf(r.art),r.base,r.models,r.name,r.seo||'',r.status]
+  const head='Артикул;Краткий;Базовое;Применимость;Наименование;Вес кг;SEO-описание;Статус\n';
+  const body=rows.map(r=>[r.art,shortOf(r.art),r.base,r.models,r.name,r.weight||'',r.seo||'',r.status]
     .map(x=>'"'+String(x||'').replace(/"/g,'""')+'"').join(';')).join('\n');
   const blob=new Blob(["\ufeff"+head+body],{type:'text/csv;charset=utf-8'});
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);
