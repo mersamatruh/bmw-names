@@ -2,5 +2,6 @@
   "server.py",
   "mod_reminders.py",
   "mod_sales.py",
-  "mod_bmw.py"
+  "mod_bmw.py",
+  "mod_backlog.py"
 ]
