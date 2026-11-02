@@ -15,6 +15,7 @@
 - Цвет диска — как у BMW, по-английски.
 - DOT из комментария → «Дата производства» («DOT уточняется» → пусто).
 - Размерность без «XL».
+- Марка шин, стиль и цвет — без нечитаемых знаков (*, ™ …), с 7.1.
 
 Слепки: wheels_snapshots/<дата-время>.json {id, title, src, rows, at}.
 """
@@ -126,6 +127,14 @@ def clean_size(s):
     return re.sub(r"\s+", " ", re.sub(r"\bXL\b", "", s)).strip()
 
 
+def clean_text(t):
+    """Убирает нечитаемые знаки (*, ™, ®, ® и т.п.) и лишние пробелы.
+    Оставляет буквы, цифры, пробел и - / . , ( ) ' +"""
+    t = re.sub(r"[^\w\s\-/.,()'+]", "", t).replace("_", " ")
+    t = re.sub(r"\(\s*\)", "", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
 def parse_dot(comment):
     """«DOT 4523-2525» → («4523-2525», ''); прочий текст → ('', текст)."""
     m = re.match(r"^\s*DOT\s*(.*)$", comment, re.I)
@@ -204,7 +213,8 @@ def convert(data):
             "art": art, "name": name, "brand": brand, "model": model,
             "axle": "Обе", "ttype": tt, "rf": "Да" if rf else "Нет",
             "diam": diam, "size": clean_size(g(r, "size")),
-            "color": g(r, "color"), "style": style, "tyre": tyre,
+            "color": clean_text(g(r, "color")), "style": clean_text(style),
+            "tyre": clean_text(tyre),
             "dot": dot, "comment": comment, "warn": "; ".join(warn),
         })
     if not out:
