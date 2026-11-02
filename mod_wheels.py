@@ -13,7 +13,8 @@
 - Параметры диска (J/ET), фото, цена и МЦП — не заполняем.
 - Датчики давления — всегда «Да». Ось «Обе», Аварийное/Комплект «Нет».
 - Цвет диска — как у BMW, по-английски.
-- DOT из комментария → «Дата производства» («DOT уточняется» → пусто).
+- DOT из комментария → «Дата производства» месяцами (7.2): «DOT 3725-4425»
+  (недели 37–44 2025 г.) → «сентябрь-октябрь 2025»; «DOT уточняется» → пусто.
 - Размерность без «XL».
 - Марка шин, стиль и цвет — без нечитаемых знаков (*, ™ …), с 7.1.
 
@@ -136,12 +137,43 @@ def clean_text(t):
 
 
 def parse_dot(comment):
-    """«DOT 4523-2525» → («4523-2525», ''); прочий текст → ('', текст)."""
+    """«DOT 3725-4425» → («сентябрь-октябрь 2025», ''); прочий текст → ('', текст)."""
     m = re.match(r"^\s*DOT\s*(.*)$", comment, re.I)
     if not m:
         return "", comment
     rest = m.group(1).strip()
-    return (rest if re.search(r"\d", rest) else ""), ""
+    if not re.search(r"\d", rest):
+        return "", ""
+    return dot_to_months(rest), ""
+
+
+MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль",
+          "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+
+
+def _week_month(code):
+    """«3725» (неделя 37, 2025 г.) → (2025, 9). Месяц — по четвергу ISO-недели."""
+    wk, yy = int(code[:2]), 2000 + int(code[2:])
+    d = datetime.date.fromisocalendar(yy, wk, 4)
+    return d.year, d.month
+
+
+def dot_to_months(rest):
+    """DOT «3725-4425» → «сентябрь-октябрь 2025»; «3225» → «август 2025»;
+    «4523-2525» → «ноябрь 2023 - июнь 2025». Непонятное — как было."""
+    codes = re.findall(r"\b(\d{4})\b", rest)
+    if not codes or len(codes) > 2:
+        return rest
+    try:
+        pts = sorted(_week_month(c) for c in codes)
+    except ValueError:
+        return rest
+    (y1, m1), (y2, m2) = pts[0], pts[-1]
+    if (y1, m1) == (y2, m2):
+        return f"{MONTHS[m1 - 1]} {y1}"
+    if y1 == y2:
+        return f"{MONTHS[m1 - 1]}-{MONTHS[m2 - 1]} {y1}"
+    return f"{MONTHS[m1 - 1]} {y1} - {MONTHS[m2 - 1]} {y2}"
 
 
 def find_cols(header):
