@@ -1,13 +1,20 @@
 """
 Подпроект «Продажи BMW» — модуль для ядра (server.py).
 
-Сборщик объявлений auto.ru по BMW X3 G01 и X5 G05 (с пробегом) и
-«цифровой отпечаток» каждой машины, чтобы узнавать её при перевыкладке:
+Сборщик объявлений auto.ru (с пробегом) по выбранным моделям/поколениям BMW
+(для начала X3 G01 и X5 G05) и «цифровой отпечаток» каждой машины, чтобы
+узнавать её при перевыкладке:
   • «корзина» — модель/кузов, год, тип двигателя, объём, мощность, коробка;
   • комплектация (список опций auto.ru) — сильный признак внутри корзины;
   • перцептивные хэши фото (dHash, 64 бита) — ловят перевыкладку тех же снимков;
   • спорные пары проверяет ИИ по сохранённым фото (по 2 на объявление).
 Пробег и цена каждой машины пишутся в отдельную историю (видны скрутки).
+
+Ежедневный сбор (по умолчанию 06:00 МСК) за один проход: новые объявления
+добавляются, исчезнувшие получают статус «снято». Дальше: auto.ru сам пишет
+«продан» → «продано»; машина вернулась в течение 14 дней (по отпечатку) →
+«перевыложено» (не продажа); не вернулась за 14 дней → «продано». Из базы
+ничего не удаляется — проданные нужны для паттернов продаж.
 
 auto.ru не пускает зарубежные адреса (Hetzner → страница входа), поэтому
 запросы идут через прокси tinyproxy на российском посреднике (Timeweb).
@@ -27,6 +34,7 @@ import threading
 import itertools
 import concurrent.futures
 import http.cookiejar
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -34,7 +42,8 @@ import urllib.request
 DEFAULT_SETTINGS = {
     "proxy": "http://201.24.54.93:8888",
     "pause": 6,          # секунд между страницами auto.ru
-    "auto_hours": 0,     # автосбор раз в N часов; 0 — только по кнопке
+    "daily_on": True,    # ежедневный автосбор
+    "daily_at": "06:00", # во сколько (по Москве)
     "photos_keep": 2,    # сколько фото объявления сохранять файлами
     "targets": [
         {"model": "X3", "code": "G01", "gens": {}},
@@ -49,6 +58,23 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 PHOTO_MATCH_BITS = 6      # хэши ближе этого порога — один и тот же снимок
 PHOTO_MATCH_SAME = 2      # столько общих снимков — та же машина без вопросов
 EQUIP_SIMILAR = 0.97      # сходство комплектаций для «возможно та же»
+SOLD_AFTER_DAYS = 14      # снято и не вернулось столько дней — считаем проданным
+MSK = "Europe/Moscow"
+
+
+def now_msk():
+    try:
+        import zoneinfo
+        return datetime.datetime.now(zoneinfo.ZoneInfo(MSK)).replace(tzinfo=None)
+    except Exception:
+        return datetime.datetime.utcnow() + datetime.timedelta(hours=3)
+
+
+def days_between(a, b):
+    try:
+        return (datetime.date.fromisoformat(b) - datetime.date.fromisoformat(a)).days
+    except (TypeError, ValueError):
+        return None
 
 
 def now_iso():
@@ -80,16 +106,29 @@ def parse_state(html):
     return None
 
 
+def crumbs(state, level):
+    """[(id, название)] из хлебных крошек страницы: MODEL_LEVEL, GENERATION_LEVEL…"""
+    for lvl in (state.get("breadcrumbsPublicApi") or {}).get("data") or []:
+        if lvl.get("meta_level") == level:
+            return [(str(e.get("id")), str(e.get("name") or "")) for e in lvl.get("entities") or []]
+    return []
+
+
 def gens_from_state(state, code):
     """{id: название} поколений модели, в названии которых есть код кузова (G05)."""
-    out = {}
-    for lvl in (state.get("breadcrumbsPublicApi") or {}).get("data") or []:
-        if lvl.get("meta_level") != "GENERATION_LEVEL":
-            continue
-        for e in lvl.get("entities") or []:
-            if code.upper() in str(e.get("name", "")).upper():
-                out[str(e.get("id"))] = e.get("name")
-    return out
+    return {i: n for i, n in crumbs(state, "GENERATION_LEVEL") if code.upper() in n.upper()}
+
+
+def gens_label(names):
+    """Короткая метка по названиям поколений: «IV (G05/G18) Рестайлинг» → «G05/G18»."""
+    out = []
+    for n in names:
+        for part in re.findall(r"\(([^)]*)\)", n):
+            for c in part.split("/"):
+                c = c.strip()
+                if c and c not in out:
+                    out.append(c)
+    return "/".join(out) or ", ".join(names)
 
 
 def photo_url(sizes, want):
@@ -126,6 +165,7 @@ def offer_record(o, target):
         "title": o.get("title") or "",
         "model": target["model"], "code": target["code"],
         "gen": (vi.get("super_gen") or {}).get("name") or "",
+        "gen_id": str((vi.get("super_gen") or {}).get("id") or ""),
         "year": docs.get("year"),
         "engine": tp.get("engine_type") or "",
         "disp": tp.get("displacement"),
@@ -444,13 +484,16 @@ def register(ctx):
                     old = offers.get(rec["id"])
                     if old:
                         # знакомое объявление: обновляем цифры, фото уже обработаны
-                        for k in ("km", "price", "region", "title", "url", "images_count", "seller"):
+                        for k in ("km", "price", "region", "title", "url", "images_count", "seller",
+                                  "model", "code", "gen", "gen_id"):
                             old[k] = rec[k]
                         old["last_seen"] = today()
                         old["run"] = run_stamp
                         if old.get("status") != "active":
+                            # объявление вернулось: снятие было временным
                             old["status"] = "active"
-                            old.pop("gone", None)
+                            for k in ("gone", "sold", "sold_how", "relisted", "site_status"):
+                                old.pop(k, None)
                         if not old.get("hashes") and not old.get("saved"):
                             old["photos"] = rec["photos"]
                         note_history(old)
@@ -483,15 +526,97 @@ def register(ctx):
         gone = 0
         if complete and not RUN["stop"]:
             with mlock:
+                gens = target.get("gens") or {}
                 for o in offers.values():
-                    if (o.get("model") == target["model"] and o.get("code") == target["code"]
-                            and o.get("status") == "active" and o.get("run") != run_stamp):
+                    if o.get("status") != "active" or o.get("run") == run_stamp:
+                        continue
+                    # своё ли это объявление: по id поколения (старые записи — по модели и метке)
+                    mine = (o["gen_id"] in gens if o.get("gen_id") else
+                            o.get("model") == target["model"] and o.get("code") == target["code"])
+                    if mine:
                         o["status"] = "gone"
                         o["gone"] = today()
+                        o.pop("site_checked", None)
                         gone += 1
         log(f"{target['model']} {target['code']}: объявлений {seen}, новых {new}, снято {gone}"
             + ("" if complete else " (проход не полный)"))
         return {"seen": seen, "new": new, "gone": gone, "complete": complete}
+
+    # ---------- Снято → продано / перевыложено ----------
+
+    def check_gone_on_site(opener):
+        """Открываем страницу каждого свежеснятого объявления: вдруг auto.ru пишет «продан»."""
+        with mlock:
+            todo = [o for o in offers.values()
+                    if o.get("status") == "gone" and not o.get("site_checked") and o.get("url")]
+        n_sold = 0
+        for i, o in enumerate(todo):
+            if RUN["stop"]:
+                break
+            RUN["stage"] = f"проверяю снятые: {i + 1} из {len(todo)}"
+            status, sold = "", False
+            try:
+                req = urllib.request.Request(o["url"], headers={
+                    "User-Agent": UA, "Accept-Language": "ru-RU,ru;q=0.9"})
+                with opener.open(req, timeout=40) as r:
+                    html = r.read().decode("utf-8", "replace")
+                    final = r.geturl()
+                if "captcha" in final or "auth.auto.ru" in final:
+                    log("проверка снятых: auto.ru показал капчу/вход — остановил проверку")
+                    break
+                st = parse_state(html) or {}
+                card = st.get("card") or {}
+                status = str(card.get("status") or "")
+                low = html.lower()
+                sold = ("SOLD" in status.upper() or "автомобиль продан" in low
+                        or "машина продана" in low)
+            except urllib.error.HTTPError as e:
+                status = f"HTTP {e.code}"
+            except Exception as e:
+                status = f"ошибка: {str(e)[:60]}"
+            with mlock:
+                o["site_checked"] = today()
+                o["site_status"] = status
+                if sold:
+                    o["status"] = "sold"
+                    o["sold"] = o.get("gone") or today()
+                    o["sold_how"] = "auto.ru: продан"
+                    n_sold += 1
+            time.sleep(settings["pause"] + random.uniform(0, 2))
+        if todo:
+            stats = {}
+            for o in todo:
+                stats[o.get("site_status") or "?"] = stats.get(o.get("site_status") or "?", 0) + 1
+            log(f"проверка снятых: {len(todo)} шт., auto.ru «продан» — {n_sold}; статусы страниц {stats}")
+
+    def update_statuses():
+        """Снятые: вернулась машина за 14 дней — перевыложено, иначе через 14 дней — продано."""
+        by_car = {}
+        for o in offers.values():
+            if o.get("cid"):
+                by_car.setdefault(o["cid"], []).append(o)
+        d0 = today()
+        n_rel = n_sold = 0
+        for o in offers.values():
+            if o.get("status") != "gone":
+                continue
+            gone = o.get("gone") or d0
+            # другое объявление этой же машины, появившееся после нашего и не позже
+            # 14 дней после снятия (бывает, что новое выкладывают раньше, чем снимают старое)
+            back = [x for x in by_car.get(o.get("cid"), [])
+                    if x is not o and (x.get("first_seen") or "") >= (o.get("first_seen") or "")
+                    and (days_between(gone, x.get("first_seen")) or 0) <= SOLD_AFTER_DAYS]
+            if back:
+                o["status"] = "relisted"
+                o["relisted"] = back[0]["id"]
+                n_rel += 1
+            elif (days_between(gone, d0) or 0) >= SOLD_AFTER_DAYS:
+                o["status"] = "sold"
+                o["sold"] = gone
+                o["sold_how"] = f"не вернулось за {SOLD_AFTER_DAYS} дней"
+                n_sold += 1
+        if n_rel or n_sold:
+            log(f"статусы: перевыложено {n_rel}, продано {n_sold}")
 
     def run_all():
         RUN.update({"running": True, "stop": False, "log": [], "stage": "старт"})
@@ -512,6 +637,10 @@ def register(ctx):
                     log(f"{t['model']} {t['code']}: ошибка — {e}")
                     summary["error"] = str(e)
                 time.sleep(settings["pause"])
+            if not RUN["stop"]:
+                check_gone_on_site(opener)
+            with mlock:
+                update_statuses()
         finally:
             summary["finished"] = now_iso()
             summary["stopped"] = RUN["stop"]
@@ -527,22 +656,28 @@ def register(ctx):
         return True
 
     def scheduler():
+        """Раз в минуту: если сегодня (по Москве) после daily_at сбора ещё не было — запускаем."""
         while True:
             time.sleep(60)
             try:
-                hrs = float(settings.get("auto_hours") or 0)
-                if hrs <= 0 or RUN["running"]:
+                if not settings.get("daily_on") or RUN["running"]:
                     continue
-                last = (settings.get("last_run") or {}).get("started")
-                due = True
-                if last:
-                    t = datetime.datetime.fromisoformat(last)
-                    due = (datetime.datetime.now() - t).total_seconds() >= hrs * 3600
-                if due:
-                    start_run()
+                now = now_msk()
+                hh, mm = (int(x) for x in str(settings.get("daily_at") or "06:00").split(":"))
+                if (now.hour, now.minute) < (hh, mm):
+                    continue
+                if settings.get("daily_done") == now.date().isoformat():
+                    continue
+                settings["daily_done"] = now.date().isoformat()
+                save_json(SETTINGS_PATH, settings)
+                log("ежедневный сбор по расписанию")
+                start_run()
             except Exception as e:
                 print("[bmw] планировщик:", e)
 
+    # после установки/перезапуска первый автосбор — по расписанию завтра, а не сразу
+    if "daily_done" not in settings:
+        settings["daily_done"] = now_msk().date().isoformat()
     threading.Thread(target=scheduler, daemon=True).start()
 
     # ---------- Сводки для страницы ----------
@@ -564,6 +699,15 @@ def register(ctx):
             kms = [h["km"] for h in hs if h.get("km")]
             drop = any(kms[i] + 500 < max(kms[:i]) for i in range(1, len(kms)))
             prices = [h["price"] for h in hs if h.get("price")]
+            # статус машины: в продаже, если хоть одно объявление живое; иначе — по последнему
+            if any(o.get("status") == "active" for o in lst):
+                status = "active"
+            else:
+                status = cur.get("status") or "gone"
+                if status == "relisted":
+                    status = "gone"
+            first = min((o.get("created") or o.get("first_seen") or "") for o in lst)
+            end = cur.get("sold") or cur.get("gone") or today()
             rows.append({
                 "cid": cid, "model": cur["model"], "code": cur["code"],
                 "gen": cur.get("gen"), "year": cur.get("year"), "tech": cur.get("tech"),
@@ -573,7 +717,11 @@ def register(ctx):
                 "region": cur.get("region"), "url": cur.get("url"),
                 "thumb": ((cur.get("photos") or [{}])[0]).get("thumb", ""),
                 "offers": len(lst),
-                "active": any(o.get("status") == "active" for o in lst),
+                "active": status == "active", "status": status,
+                "sold": cur.get("sold") if status == "sold" else None,
+                "sold_how": cur.get("sold_how") if status == "sold" else None,
+                "gone": cur.get("gone") if status in ("gone", "sold") else None,
+                "days": days_between(first, end),
                 "first_seen": min(o.get("first_seen") or "" for o in lst),
                 "last_seen": cur.get("last_seen"),
                 "km_drop": drop, "seller_type": cur.get("seller_type"),
@@ -586,7 +734,7 @@ def register(ctx):
         return {k: o.get(k) for k in ("id", "cid", "url", "title", "gen", "year", "tech", "trans",
                                       "compl", "km", "price", "region", "seller", "seller_type",
                                       "status", "first_seen", "last_seen", "gone", "created",
-                                      "saved", "why")} | {
+                                      "saved", "why", "sold", "sold_how", "site_status")} | {
             "thumbs": [p.get("thumb") for p in (o.get("photos") or [])][:6],
             "equip_n": len(o.get("equip") or [])}
 
@@ -598,13 +746,19 @@ def register(ctx):
             return deny()
         with mlock:
             act = sum(1 for o in offers.values() if o.get("status") == "active")
+            st_n = {}
+            for o in offers.values():
+                st_n[o.get("status")] = st_n.get(o.get("status"), 0) + 1
             pend = sum(1 for p in cars["pairs"] if p["status"] == "new")
             ncars = len({o.get("cid") for o in offers.values() if o.get("cid")})
             return jsonify({
                 "settings": {k: settings.get(k) for k in
-                             ("proxy", "pause", "auto_hours", "photos_keep", "targets", "last_run")},
+                             ("proxy", "pause", "daily_on", "daily_at", "photos_keep",
+                              "targets", "last_run")},
                 "run": {k: RUN[k] for k in ("running", "stage", "log")},
                 "counts": {"offers": len(offers), "active": act, "cars": ncars,
+                           "gone": st_n.get("gone", 0), "sold": st_n.get("sold", 0),
+                           "relisted": st_n.get("relisted", 0),
                            "pairs": pend, "history": len(history)},
                 "pillow": have_pillow(),
             })
@@ -617,7 +771,16 @@ def register(ctx):
         with mlock:
             if "proxy" in d:
                 settings["proxy"] = str(d["proxy"] or "").strip()
-            for k, lo, hi in (("pause", 2, 120), ("auto_hours", 0, 720), ("photos_keep", 0, 10)):
+            if "daily_on" in d:
+                settings["daily_on"] = bool(d["daily_on"])
+            if "daily_at" in d:
+                t = str(d["daily_at"] or "").strip()
+                if not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", t):
+                    return jsonify({"error": "Время в виде ЧЧ:ММ, например 06:00"}), 400
+                if t != settings.get("daily_at"):
+                    settings["daily_at"] = t
+                    settings.pop("daily_done", None)   # новое время — сегодня можно ещё раз
+            for k, lo, hi in (("pause", 2, 120), ("photos_keep", 0, 10)):
                 if k in d:
                     try:
                         settings[k] = max(lo, min(hi, float(d[k])))
@@ -640,6 +803,52 @@ def register(ctx):
             return deny()
         RUN["stop"] = True
         return jsonify({"ok": True})
+
+    CATALOG_CACHE = {}
+
+    @app.get("/api/bmw_catalog")
+    def api_bmw_catalog():
+        """Без model — список моделей BMW на auto.ru; с model — её поколения."""
+        if not check_auth(request):
+            return deny()
+        model = re.sub(r"[^A-Za-z0-9_]", "", request.args.get("model", ""))
+        key = model.upper() or "*"
+        if key not in CATALOG_CACHE:
+            url = (f"https://auto.ru/cars/bmw/{model.lower()}/used/" if model
+                   else "https://auto.ru/cars/bmw/used/")
+            try:
+                st = get(make_opener(), url)
+            except Exception as e:
+                return jsonify({"error": f"auto.ru не ответил: {e}"}), 502
+            items = crumbs(st, "GENERATION_LEVEL" if model else "MODEL_LEVEL")
+            if not items:
+                return jsonify({"error": "Список не нашёлся на странице auto.ru"}), 502
+            CATALOG_CACHE[key] = [{"id": i, "name": n} for i, n in items]
+        return jsonify({"items": CATALOG_CACHE[key]})
+
+    @app.post("/api/bmw_targets")
+    def api_bmw_targets():
+        """Новый список «что собираем»: [{model, code, gens:{id: название}}]."""
+        if not check_auth(request):
+            return deny()
+        if RUN["running"]:
+            return jsonify({"error": "Идёт сбор — поменяйте список после него"}), 409
+        out = []
+        for t in (request.get_json(force=True) or {}).get("targets") or []:
+            model = re.sub(r"[^A-Za-z0-9_]", "", str(t.get("model") or "")).upper()
+            gens = {str(k): str(v) for k, v in (t.get("gens") or {}).items()
+                    if re.fullmatch(r"\d+", str(k))}
+            if not model or not gens:
+                return jsonify({"error": "У каждой модели нужно выбрать хотя бы одно поколение"}), 400
+            code = str(t.get("code") or "").strip()[:40] or gens_label(list(gens.values()))
+            out.append({"model": model, "code": code, "gens": gens})
+        keys = [(t["model"], t["code"]) for t in out]
+        if len(set(keys)) != len(keys):
+            return jsonify({"error": "Одна и та же модель с той же меткой указана дважды"}), 400
+        with mlock:
+            settings["targets"] = out
+            save_json(SETTINGS_PATH, settings)
+        return jsonify({"ok": True, "targets": out})
 
     @app.get("/api/bmw_cars")
     def api_bmw_cars():
@@ -803,9 +1012,9 @@ def register(ctx):
 
     SECTION_HTML = """
   <h2 style="margin:0 0 4px">🚙 Продажи BMW</h2>
-  <p class="hint" style="margin:0 0 12px">Объявления auto.ru: BMW X3 G01 и X5 G05 с пробегом.
-    У каждой машины — цифровой отпечаток (корзина: год, двигатель, мощность, коробка +
-    комплектация + отпечатки фото), чтобы узнавать её при перевыкладке. Пробег и цена — в истории.</p>
+  <p class="hint" style="margin:0 0 12px">Объявления auto.ru с пробегом по выбранным моделям (<span id="bmwTargetsLine"></span>).
+    Каждый день новые объявления добавляются, исчезнувшие помечаются «снято», через 14 дней — «продано»
+    (если машина не вернулась: её узнаём по отпечатку — год, двигатель, мощность, коробка, комплектация, фото).</p>
   <div class="bar">
     <button class="primary" id="bmwRunBtn" onclick="bmwRun()">▶ Собрать сейчас</button>
     <button id="bmwStopBtn" onclick="bmwStop()" style="display:none">■ Остановить</button>
@@ -815,11 +1024,26 @@ def register(ctx):
   <div id="bmwCounts" class="hint" style="margin-bottom:8px"></div>
   <details id="bmwSet" style="margin-bottom:12px">
     <summary class="hint" style="cursor:pointer">⚙ Настройки и журнал</summary>
+    <div class="bmwsetbox">
+      <b>Что собираем</b>
+      <div id="bmwTargets" style="margin:6px 0"></div>
+      <div class="bar">
+        <button onclick="bmwLoadModels(this)">＋ Добавить модель</button>
+        <select id="bmwAddModel" style="display:none" onchange="bmwLoadGens()"></select>
+        <span id="bmwAddMsg" class="hint"></span>
+      </div>
+      <div id="bmwAddGens" style="display:none">
+        <div id="bmwGenList" class="bmwgens"></div>
+        <div class="bar"><label class="hint">Метка <input id="bmwAddCode" style="width:140px"></label>
+          <button class="primary" onclick="bmwAddTarget()">Добавить в список</button></div>
+      </div>
+    </div>
     <div class="bar" style="margin-top:8px">
-      <label class="hint">Прокси <input id="bmwProxy" style="width:230px"></label>
+      <label class="hint"><input type="checkbox" id="bmwDailyOn"> Собирать каждый день в</label>
+      <input id="bmwDailyAt" style="width:70px" placeholder="06:00"><span class="hint">по Москве</span>
       <label class="hint">Пауза между страницами, с <input id="bmwPause" type="number" style="width:60px"></label>
-      <label class="hint">Автосбор раз в N часов (0 — выкл.) <input id="bmwAuto" type="number" style="width:60px"></label>
       <label class="hint">Фото хранить <input id="bmwKeep" type="number" style="width:50px"></label>
+      <label class="hint">Прокси <input id="bmwProxy" style="width:230px"></label>
       <button onclick="bmwSaveSettings()">Сохранить</button>
     </div>
     <pre id="bmwLog" class="bmwlog"></pre>
@@ -831,10 +1055,10 @@ def register(ctx):
   </div>
   <div id="bmwT_cars">
     <div class="bar">
-      <select id="bmwFModel" onchange="bmwRenderCars()"><option value="">Все модели</option>
-        <option value="X3">X3 G01</option><option value="X5">X5 G05</option></select>
-      <select id="bmwFAct" onchange="bmwRenderCars()"><option value="1">В продаже</option>
-        <option value="0">Снятые</option><option value="">Все</option></select>
+      <select id="bmwFModel" onchange="bmwRenderCars()"><option value="">Все модели</option></select>
+      <select id="bmwFAct" onchange="bmwRenderCars()"><option value="active">В продаже</option>
+        <option value="gone">Сняты (ждём 14 дней)</option><option value="sold">Проданы</option>
+        <option value="">Все</option></select>
       <input id="bmwFText" placeholder="Поиск: 30d, M Sport, Москва…" oninput="bmwRenderCars()" style="min-width:220px">
       <label class="hint"><input type="checkbox" id="bmwFDrop" onchange="bmwRenderCars()"> только со скруткой</label>
       <label class="hint"><input type="checkbox" id="bmwFMulti" onchange="bmwRenderCars()"> только перевыложенные</label>
@@ -883,10 +1107,14 @@ def register(ctx):
             align-items:flex-start;justify-content:center;overflow:auto;padding:30px 10px}
   .bmwbox{background:var(--panel);border-radius:10px;padding:16px 18px;max-width:1000px;width:100%}
   .bmwbox table td{padding:4px 8px;border-top:1px solid var(--line);font-size:13px}
+  .bmwsetbox{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-top:8px}
+  .bmwtarget{display:flex;gap:10px;align-items:center;padding:4px 0}
+  .bmwgens{display:flex;flex-direction:column;gap:2px;margin:6px 0 8px}
+  .bmwsold{color:var(--ok);font-weight:600;white-space:nowrap}
 """
 
     JS = r"""
-var BMW={cars:[],hist:[],pairs:[],sort:{k:'last_seen',d:-1},timer:null,tab:'cars'};
+var BMW={cars:[],hist:[],pairs:[],targets:[],sort:{k:'first_seen',d:-1},timer:null,tab:'cars'};
 function bmwEsc(s){return (s==null?'':s+'').replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 function bmwNum(n){return n==null||n===''?'':Number(n).toLocaleString('ru-RU');}
@@ -900,7 +1128,9 @@ async function bmwLoadState(){
   document.getElementById('bmwStage').textContent=r.running?('Идёт сбор: '+(r.stage||'…')):
     (lr.finished?('Последний сбор: '+lr.finished.replace('T',' ')+(lr.error?' — ошибка: '+lr.error:'')):'Ещё не собирали');
   document.getElementById('bmwCounts').textContent='Машин: '+bmwNum(c.cars)+' · объявлений: '+bmwNum(c.offers)
-    +' (в продаже '+bmwNum(c.active)+') · записей пробега: '+bmwNum(c.history);
+    +' — в продаже '+bmwNum(c.active)+', снято '+bmwNum(c.gone)+', продано '+bmwNum(c.sold)
+    +', перевыложено '+bmwNum(c.relisted)+' · записей пробега: '+bmwNum(c.history);
+  BMW.targets=s.targets||[]; bmwRenderTargets();
   document.getElementById('bmwPairsN').textContent=c.pairs?('('+c.pairs+')'):'';
   var w=document.getElementById('bmwWarn');
   if(!d.pillow){ w.style.display=''; w.innerHTML='Для отпечатков фото на сервере нужна библиотека Pillow. '
@@ -908,7 +1138,8 @@ async function bmwLoadState(){
   var px=document.getElementById('bmwProxy');
   if(document.activeElement!==px && !BMW.setLoaded){
     px.value=s.proxy||''; document.getElementById('bmwPause').value=s.pause;
-    document.getElementById('bmwAuto').value=s.auto_hours; document.getElementById('bmwKeep').value=s.photos_keep;
+    document.getElementById('bmwDailyOn').checked=!!s.daily_on; document.getElementById('bmwDailyAt').value=s.daily_at||'06:00';
+    document.getElementById('bmwKeep').value=s.photos_keep;
     BMW.setLoaded=true;
   }
   document.getElementById('bmwLog').textContent=(r.log||[]).join('\n')||'Журнал пуст.';
@@ -920,9 +1151,76 @@ async function bmwRun(){ await api('/api/bmw_run',{}); BMW.wasRunning=true; bmwL
 async function bmwStop(){ await api('/api/bmw_stop',{}); bmwLoadState(); }
 async function bmwSaveSettings(){
   var r=await api('/api/bmw_settings',{proxy:document.getElementById('bmwProxy').value,
-    pause:document.getElementById('bmwPause').value, auto_hours:document.getElementById('bmwAuto').value,
+    pause:document.getElementById('bmwPause').value, daily_on:document.getElementById('bmwDailyOn').checked,
+    daily_at:document.getElementById('bmwDailyAt').value,
     photos_keep:document.getElementById('bmwKeep').value});
   alert(r&&r.error?r.error:'Сохранено'); BMW.setLoaded=false; bmwLoadState();
+}
+function bmwTKey(t){ return t.model+' '+t.code; }
+function bmwRenderTargets(){
+  var box=document.getElementById('bmwTargets');
+  document.getElementById('bmwTargetsLine').textContent=BMW.targets.map(function(t){ return 'BMW '+bmwTKey(t); }).join(', ')||'ничего не выбрано';
+  box.innerHTML=BMW.targets.map(function(t,i){
+    var g=Object.keys(t.gens||{}).map(function(k){ return t.gens[k]; }).join('; ');
+    return '<div class="bmwtarget"><b>BMW '+bmwEsc(bmwTKey(t))+'</b><span class="hint">'+bmwEsc(g||'поколения найдутся при сборе')+'</span>'
+      +'<button onclick="bmwDelTarget('+i+')">✕ Убрать</button></div>';
+  }).join('')||'<div class="hint">Список пуст — добавьте модель.</div>';
+  var sel=document.getElementById('bmwFModel'), cur=sel.value;
+  var ms=[]; BMW.targets.forEach(function(t){ if(ms.indexOf(t.model)<0) ms.push(t.model); });
+  BMW.cars.forEach(function(c){ if(ms.indexOf(c.model)<0) ms.push(c.model); });
+  sel.innerHTML='<option value="">Все модели</option>'+ms.map(function(m){
+    return '<option value="'+bmwEsc(m)+'">BMW '+bmwEsc(m)+'</option>'; }).join('');
+  sel.value=cur;
+}
+async function bmwSaveTargets(list){
+  var r=await api('/api/bmw_targets',{targets:list});
+  if(r&&r.error){ alert(r.error); return false; }
+  BMW.targets=r.targets; bmwRenderTargets(); return true;
+}
+function bmwDelTarget(i){
+  var t=BMW.targets[i];
+  if(!confirm('Перестать собирать BMW '+bmwTKey(t)+'? Уже собранные объявления останутся в базе.')) return;
+  bmwSaveTargets(BMW.targets.filter(function(x,j){ return j!==i; }));
+}
+async function bmwLoadModels(btn){
+  var msg=document.getElementById('bmwAddMsg'), sel=document.getElementById('bmwAddModel');
+  btn.disabled=true; msg.textContent='Загружаю модели с auto.ru…';
+  var r=await apiGet('/api/bmw_catalog'); btn.disabled=false;
+  if(!r||r.error){ msg.textContent=(r&&r.error)||'Не удалось'; return; }
+  msg.textContent='';
+  sel.innerHTML='<option value="">— модель —</option>'+r.items.map(function(m){
+    return '<option value="'+bmwEsc(m.id)+'">'+bmwEsc(m.name)+'</option>'; }).join('');
+  sel.style.display='';
+}
+async function bmwLoadGens(){
+  var m=document.getElementById('bmwAddModel').value, msg=document.getElementById('bmwAddMsg'),
+      box=document.getElementById('bmwAddGens');
+  box.style.display='none'; if(!m) return;
+  msg.textContent='Загружаю поколения…';
+  var r=await apiGet('/api/bmw_catalog?model='+encodeURIComponent(m));
+  if(!r||r.error){ msg.textContent=(r&&r.error)||'Не удалось'; return; }
+  msg.textContent='Отметьте поколения:';
+  document.getElementById('bmwGenList').innerHTML=r.items.map(function(g){
+    return '<label><input type="checkbox" value="'+bmwEsc(g.id)+'" data-name="'+bmwEsc(g.name)+'" onchange="bmwGenLabel()"> '+bmwEsc(g.name)+'</label>'; }).join('');
+  document.getElementById('bmwAddCode').value='';
+  box.style.display='';
+}
+function bmwGenLabel(){
+  var out=[];
+  document.querySelectorAll('#bmwGenList input:checked').forEach(function(c){
+    (c.dataset.name.match(/\(([^)]*)\)/g)||[]).forEach(function(p){
+      p.slice(1,-1).split('/').forEach(function(x){ x=x.trim(); if(x && out.indexOf(x)<0) out.push(x); }); }); });
+  document.getElementById('bmwAddCode').value=out.join('/');
+}
+async function bmwAddTarget(){
+  var gens={};
+  document.querySelectorAll('#bmwGenList input:checked').forEach(function(c){ gens[c.value]=c.dataset.name; });
+  if(!Object.keys(gens).length){ alert('Отметьте хотя бы одно поколение'); return; }
+  var t={model:document.getElementById('bmwAddModel').value, code:document.getElementById('bmwAddCode').value, gens:gens};
+  if(await bmwSaveTargets(BMW.targets.concat([t]))){
+    document.getElementById('bmwAddGens').style.display='none';
+    document.getElementById('bmwAddMsg').textContent='Добавлено. Соберётся при следующем сборе.';
+  }
 }
 function bmwTab(t){
   BMW.tab=t;
@@ -938,7 +1236,7 @@ async function bmwLoadAll(){
 }
 var BMW_COLS=[['thumb','Фото'],['model','Модель'],['year','Год'],['tech','Двигатель'],['trans','КПП'],
   ['compl','Комплектация'],['km','Пробег'],['price','Цена'],['region','Регион'],['offers','Объявл.'],
-  ['first_seen','Впервые'],['last_seen','Последний раз']];
+  ['first_seen','Впервые'],['status','Статус'],['days','Дней на продаже']];
 function bmwSortBy(k){ if(BMW.sort.k===k) BMW.sort.d*=-1; else BMW.sort={k:k,d:1}; bmwRenderCars(); }
 function bmwRenderCars(){
   var fm=document.getElementById('bmwFModel').value, fa=document.getElementById('bmwFAct').value,
@@ -946,8 +1244,7 @@ function bmwRenderCars(){
       fd=document.getElementById('bmwFDrop').checked, fmu=document.getElementById('bmwFMulti').checked;
   var rows=BMW.cars.filter(function(c){
     if(fm && c.model!==fm) return false;
-    if(fa==='1' && !c.active) return false;
-    if(fa==='0' && c.active) return false;
+    if(fa && c.status!==fa) return false;
     if(fd && !c.km_drop) return false;
     if(fmu && c.offers<2) return false;
     if(ft && [c.tech,c.compl,c.region,c.gen,c.year].join(' ').toLowerCase().indexOf(ft)<0) return false;
@@ -968,11 +1265,16 @@ function bmwRenderCars(){
       +'<td>'+bmwEsc(c.compl)+'</td>'
       +'<td class="bmwnum'+(c.km_drop?' bmwbad':'')+'">'+bmwNum(c.km)+(c.km_drop?' ⚠':'')+'</td>'
       +'<td class="bmwnum">'+pr+'</td><td>'+bmwEsc(c.region)+'</td>'
-      +'<td class="bmwnum">'+c.offers+'</td><td>'+bmwEsc(c.first_seen)+'</td><td>'+bmwEsc(c.last_seen)
-      +(c.active?'':' <span class="hint">снято</span>')+'</td></tr>';
+      +'<td class="bmwnum">'+c.offers+'</td><td>'+bmwEsc(c.first_seen)+'</td>'
+      +'<td>'+bmwStatus(c)+'</td><td class="bmwnum">'+(c.days==null?'':c.days)+'</td></tr>';
   });
   document.getElementById('bmwCars').innerHTML=h;
   document.getElementById('bmwCarsN').textContent='Показано '+Math.min(rows.length,1500)+' из '+rows.length;
+}
+function bmwStatus(c){
+  if(c.status==='active') return 'в продаже';
+  if(c.status==='sold') return '<span class="bmwsold">продано '+bmwEsc(c.sold)+'</span><div class="hint">'+bmwEsc(c.sold_how)+'</div>';
+  return 'снято '+bmwEsc(c.gone)+'<div class="hint">ждём 14 дней</div>';
 }
 function bmwRenderHist(){
   var only=document.getElementById('bmwHDrop').checked;
@@ -1002,7 +1304,10 @@ function bmwOfferHtml(o){
     +'<div>'+bmwEsc(o.year)+' г. · '+bmwEsc(o.tech)+' · '+bmwEsc(o.compl)+' · опций '+o.equip_n+'</div>'
     +'<div>Пробег <b>'+bmwNum(o.km)+'</b> км · цена <b>'+bmwNum(o.price)+'</b> ₽ · '+bmwEsc(o.region)+'</div>'
     +'<div class="hint">'+bmwEsc(o.seller||'')+' ('+bmwEsc(o.seller_type)+') · на сайте с '+bmwEsc(o.created||o.first_seen)
-    +(o.status==='gone'?' · снято '+bmwEsc(o.gone):'')+'</div>';
+    +(o.status==='gone'?' · снято '+bmwEsc(o.gone):'')
+    +(o.status==='relisted'?' · снято '+bmwEsc(o.gone)+', перевыложено':'')
+    +(o.status==='sold'?' · <span class="bmwsold">продано '+bmwEsc(o.sold)+'</span> ('+bmwEsc(o.sold_how)+')':'')
+    +(o.site_status?' · страница auto.ru: '+bmwEsc(o.site_status):'')+'</div>';
 }
 function bmwRenderPairs(){
   var box=document.getElementById('bmwPairs');
