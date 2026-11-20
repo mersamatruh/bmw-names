@@ -101,36 +101,99 @@ def register(ctx):
 
     # ---------- ИИ-разбор ----------
 
+    PROMPT = (
+        "Это файл, присланный в рабочий чат. Определи, счёт ли это на оплату "
+        "(инвойс/счёт-фактура для оплаты поставщику). Если да — извлеки:\n"
+        "- contractor: кто выставил счёт (поставщик/продавец, название организации "
+        "полностью, как в документе);\n"
+        "- amount: итоговая сумма «всего к оплате» (с валютой, как в документе);\n"
+        "- date: дата счёта в формате ДД.ММ.ГГГГ.\n"
+        "Если это НЕ счёт на оплату — is_invoice=false и коротко why.\n"
+        "Ответь ТОЛЬКО JSON: {\"is_invoice\": true|false, \"contractor\": \"...\", "
+        "\"amount\": \"...\", \"date\": \"...\", \"why\": \"кратко по-русски\"}")
+
+    def _manual(why):
+        return {"is_invoice": None, "contractor": "", "amount": "", "date": "", "why": why}
+
+    def _ensure_mod(name):
+        try:
+            __import__(name)
+            return True
+        except ImportError:
+            pass
+        try:
+            import subprocess
+            import sys
+            subprocess.run([sys.executable, "-m", "pip", "install", name],
+                           timeout=180, capture_output=True)
+            __import__(name)
+            return True
+        except Exception as e:
+            warn(f"не удалось подключить {name}: {e}")
+            return False
+
+    def excel_to_text(data, filename):
+        """Текст из Excel (все листы). .xlsx — openpyxl, .xls — xlrd."""
+        low = (filename or "").lower()
+        is_x = low.endswith(("xlsx", "xlsm")) or data[:2] == b"PK"
+        engine = "openpyxl" if is_x else "xlrd"
+        if not _ensure_mod(engine):
+            return None
+        import tempfile
+        import pandas as pd
+        tmp = tempfile.NamedTemporaryFile(suffix=".xlsx" if is_x else ".xls", delete=False)
+        try:
+            tmp.write(data)
+            tmp.close()
+            sheets = pd.read_excel(tmp.name, sheet_name=None, header=None, engine=engine)
+            parts = []
+            for _, df in sheets.items():
+                for _, row in df.iterrows():
+                    cells = [str(c).strip() for c in row.tolist()
+                             if str(c) != "nan" and str(c).strip()]
+                    if cells:
+                        parts.append(" | ".join(cells))
+            return "\n".join(parts)[:15000] or None
+        except Exception as e:
+            warn(f"excel read: {e}")
+            return None
+        finally:
+            try:
+                os.remove(tmp.name)
+            except Exception:
+                pass
+
     def analyze(data, mime, filename):
         low = (filename or "").lower()
-        block = None
+        mime = mime or ""
+        content = None
         if mime in IMG_MIMES:
-            block = {"type": "image", "source": {
+            content = [{"type": "image", "source": {
                 "type": "base64", "media_type": mime,
-                "data": base64.b64encode(data).decode()}}
+                "data": base64.b64encode(data).decode()}},
+                {"type": "text", "text": PROMPT}]
         elif mime == "application/pdf" or low.endswith(".pdf") or data[:5] == b"%PDF-":
-            block = {"type": "document", "source": {
+            content = [{"type": "document", "source": {
                 "type": "base64", "media_type": "application/pdf",
-                "data": base64.b64encode(data).decode()}}
+                "data": base64.b64encode(data).decode()}},
+                {"type": "text", "text": PROMPT}]
+        elif (low.endswith((".xls", ".xlsx", ".xlsm")) or "excel" in mime
+              or "spreadsheet" in mime):
+            txt = excel_to_text(data, filename)
+            if txt:
+                content = [{"type": "text",
+                            "text": PROMPT + "\n\nТЕКСТ ИЗ EXCEL-ФАЙЛА:\n" + txt}]
+            else:
+                return _manual("не удалось прочитать Excel — заполните поля вручную "
+                               "или пересохраните файл в .xlsx")
 
         client, model = ctx.get("client"), ctx.get("model")
-        if block is None or client is None or not model or len(data) > MAX_AI_BYTES:
-            return {"is_invoice": None, "contractor": "", "amount": "",
-                    "date": "", "why": "авторазбор для этого файла недоступен — "
-                                       "заполните поля вручную"}
-        prompt = (
-            "Это файл, присланный в рабочий чат. Определи, счёт ли это на оплату "
-            "(инвойс/счёт-фактура для оплаты поставщику). Если да — извлеки:\n"
-            "- contractor: кто выставил счёт (поставщик/продавец, название организации);\n"
-            "- amount: итоговая сумма к оплате (с валютой, как в документе);\n"
-            "- date: дата счёта в формате ДД.ММ.ГГГГ.\n"
-            "Если это НЕ счёт на оплату — is_invoice=false и коротко why.\n"
-            "Ответь ТОЛЬКО JSON: {\"is_invoice\": true|false, \"contractor\": \"...\", "
-            "\"amount\": \"...\", \"date\": \"...\", \"why\": \"кратко по-русски\"}")
+        if content is None or client is None or not model or len(data) > MAX_AI_BYTES:
+            return _manual("авторазбор для этого файла недоступен — заполните поля вручную")
         try:
             msg = client.messages.create(
                 model=model, max_tokens=500,
-                messages=[{"role": "user", "content": [block, {"type": "text", "text": prompt}]}])
+                messages=[{"role": "user", "content": content}])
             if ctx.get("add_cost"):
                 ctx["add_cost"](msg)
             txt = (ctx["extract_text"](msg) if ctx.get("extract_text")
@@ -138,8 +201,7 @@ def register(ctx):
             m = re.search(r"\{.*\}", txt, re.S)
             res = json.loads(m.group(0)) if m else {}
         except Exception as e:
-            return {"is_invoice": None, "contractor": "", "amount": "", "date": "",
-                    "why": f"ИИ не смог разобрать ({e}) — заполните вручную"}
+            return _manual(f"ИИ не смог разобрать ({e}) — заполните вручную")
         return {
             "is_invoice": bool(res.get("is_invoice")),
             "contractor": str(res.get("contractor") or "")[:200],
