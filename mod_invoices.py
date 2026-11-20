@@ -488,7 +488,7 @@ def register(ctx):
 """
 
     CSS = """
-  #invList table{border-collapse:collapse;width:100%;max-width:1100px}
+  #invList table{border-collapse:collapse;width:100%;max-width:1300px}
   #invList th,#invList td{border:1px solid var(--line);padding:6px 8px;text-align:left;
                           vertical-align:top;font-size:14px}
   #invList th{background:var(--bg);font-weight:600;white-space:nowrap}
@@ -543,7 +543,7 @@ function invRow(v){
   act += '<button onclick="invDelete('+v.id+')" title="удалить">🗑</button>';
   return '<tr'+cls+'>'
     +'<td><button onclick="invOpenFile('+v.id+')" title="'+invEsc(v.file_name)+'">📄 Открыть</button>'+warn+'</td>'
-    +'<td><input class="ic" value="'+invEsc(v.contractor||'')+'" onchange="invEdit('+v.id+',\\'contractor\\',this)"></td>'
+    +'<td><input class="ic" value="'+invEsc(v.contractor||'')+'" onchange="invEdit('+v.id+',\\'contractor\\',this)" style="min-width:340px"></td>'
     +'<td><input class="ic" value="'+invEsc(v.amount||'')+'" onchange="invEdit('+v.id+',\\'amount\\',this)" style="min-width:90px"></td>'
     +'<td><input class="ic" value="'+invEsc(v.date||'')+'" onchange="invEdit('+v.id+',\\'date\\',this)" style="min-width:90px"></td>'
     +'<td class="hint">'+invEsc(v.added_by||'')+'<br>'+invEsc(v.added_at||'')+'</td>'
