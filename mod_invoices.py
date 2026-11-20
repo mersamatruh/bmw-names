@@ -107,13 +107,30 @@ def register(ctx):
         "- contractor: кто выставил счёт (поставщик/продавец, название организации "
         "полностью, как в документе);\n"
         "- amount: итоговая сумма «всего к оплате» (с валютой, как в документе);\n"
-        "- date: дата счёта в формате ДД.ММ.ГГГГ.\n"
+        "- date: дата счёта в формате ДД.ММ.ГГГГ;\n"
+        "- positions: массив позиций (товары/услуги) из таблицы счёта, по каждой: "
+        "name (наименование), qty (количество), unit (единица, напр. шт), "
+        "price (цена за единицу), sum (сумма по строке). Бери все строки таблицы, "
+        "без итогов/НДС отдельной позицией.\n"
         "Если это НЕ счёт на оплату — is_invoice=false и коротко why.\n"
         "Ответь ТОЛЬКО JSON: {\"is_invoice\": true|false, \"contractor\": \"...\", "
-        "\"amount\": \"...\", \"date\": \"...\", \"why\": \"кратко по-русски\"}")
+        "\"amount\": \"...\", \"date\": \"...\", \"positions\": "
+        "[{\"name\":\"...\",\"qty\":\"...\",\"unit\":\"...\",\"price\":\"...\",\"sum\":\"...\"}], "
+        "\"why\": \"кратко по-русски\"}")
+
+    def _positions(res):
+        out = []
+        for p in (res.get("positions") or [])[:300]:
+            if not isinstance(p, dict):
+                continue
+            row = {k: str(p.get(k) or "")[:300] for k in ("name", "qty", "unit", "price", "sum")}
+            if row["name"] or row["sum"]:
+                out.append(row)
+        return out
 
     def _manual(why):
-        return {"is_invoice": None, "contractor": "", "amount": "", "date": "", "why": why}
+        return {"is_invoice": None, "contractor": "", "amount": "", "date": "",
+                "positions": [], "why": why}
 
     def _ensure_mod(name):
         try:
@@ -192,7 +209,7 @@ def register(ctx):
             return _manual("авторазбор для этого файла недоступен — заполните поля вручную")
         try:
             msg = client.messages.create(
-                model=model, max_tokens=500,
+                model=model, max_tokens=2000,
                 messages=[{"role": "user", "content": content}])
             if ctx.get("add_cost"):
                 ctx["add_cost"](msg)
@@ -207,6 +224,7 @@ def register(ctx):
             "contractor": str(res.get("contractor") or "")[:200],
             "amount": str(res.get("amount") or "")[:60],
             "date": str(res.get("date") or "")[:40],
+            "positions": _positions(res),
             "why": str(res.get("why") or "")[:300],
         }
 
@@ -226,7 +244,8 @@ def register(ctx):
             item = {
                 "id": iid, "file_name": fname, "stored": stored, "mime": mime,
                 "contractor": res.get("contractor", ""), "amount": res.get("amount", ""),
-                "date": res.get("date", ""), "status": "pending",
+                "date": res.get("date", ""), "positions": res.get("positions", []),
+                "status": "pending",
                 "added_at": now_msk(), "added_by": by, "chat": chat,
                 "auto": res.get("is_invoice") is True, "ai_why": res.get("why", ""),
             }
@@ -476,6 +495,8 @@ def register(ctx):
                 v = res.get(k)
                 if v:
                     cur[k] = str(v)[:200]
+            if res.get("positions"):
+                cur["positions"] = res["positions"]
             cur["auto"] = res.get("is_invoice") is True
             cur["ai_why"] = res.get("why", "")
             save(store)
@@ -576,6 +597,11 @@ def register(ctx):
     <span class="sp" style="flex:1"></span>
     <span class="hint" id="invCounts"></span>
   </div>
+  <div class="bar" style="margin-bottom:10px">
+    <input id="invSearch" oninput="renderInvoices()" placeholder="🔍 Поиск по позициям и контрагенту (напр. стул)"
+           style="flex:1;min-width:240px;padding:7px 9px;border:1px solid var(--line);border-radius:6px;font:inherit">
+    <span class="hint" id="invSearchInfo"></span>
+  </div>
   <div id="invList"><div class="hint">Загрузка…</div></div>
 """
 
@@ -594,10 +620,50 @@ def register(ctx):
   .inv-rejected{background:#f6dede;color:#8a2020}
   .inv-act button{margin:0 2px}
   #invList tr.done td{opacity:.6}
+  #invList button.invexp{border:none;background:none;cursor:pointer;font:inherit;
+                         color:var(--mut,#888);padding:0 2px;line-height:1}
+  #invList td.cpar{display:flex;align-items:center;gap:5px}
+  #invList tr.inv-detail>td{background:var(--bg);padding:8px 12px}
+  #invList table.posT{width:auto;max-width:960px;margin:2px 0;border-collapse:collapse}
+  #invList table.posT th,#invList table.posT td{font-size:13px;padding:4px 8px;border:1px solid var(--line)}
+  #invList table.posT th{background:var(--panel,#f4f4f4);white-space:nowrap}
+  #invList table.posT td.num{text-align:right;white-space:nowrap}
+  #invList .posNone{color:var(--mut,#888);font-size:13px}
+  #invList mark{background:#ffe9a8;color:inherit;padding:0 2px;border-radius:3px}
 """
 
     JS = """
 var INV_ITEMS = [];
+var INV_OPEN = {};
+function invToggle(id){ INV_OPEN[id] = !INV_OPEN[id]; renderInvoices(); }
+function invHi(s,q){
+  s = invEsc(s||'');
+  if(!q) return s;
+  try{
+    var re = new RegExp('('+q.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&')+')','ig');
+    return s.replace(re,'<mark>$1</mark>');
+  }catch(e){ return s; }
+}
+function invDetail(v,q){
+  var ps = v.positions || [];
+  if(!ps.length){
+    return '<tr class="inv-detail"><td colspan="7">'
+      +'<div class="posNone">Позиции не распознаны. '
+      +'Нажмите 🔄 чтобы переразобрать файл.</div></td></tr>';
+  }
+  var h='<tr class="inv-detail"><td colspan="7"><table class="posT"><thead><tr>'
+    +'<th>#</th><th>Наименование</th><th>Кол-во</th><th>Ед.</th>'
+    +'<th>Цена</th><th>Сумма</th></tr></thead><tbody>';
+  ps.forEach(function(p,i){
+    h+='<tr><td class="num">'+(i+1)+'</td>'
+      +'<td>'+invHi(p.name,q)+'</td>'
+      +'<td class="num">'+invEsc(p.qty||'')+'</td>'
+      +'<td>'+invEsc(p.unit||'')+'</td>'
+      +'<td class="num">'+invEsc(p.price||'')+'</td>'
+      +'<td class="num">'+invEsc(p.sum||'')+'</td></tr>';
+  });
+  return h+'</tbody></table></td></tr>';
+}
 function invBadge(s){
   var t = s==='approved' ? ['Одобрен','inv-approved'] :
           s==='rejected' ? ['Отклонён','inv-rejected'] : ['На одобрении','inv-pending'];
@@ -640,7 +706,7 @@ async function invReparseAll(){
   }
   loadInvoices();
 }
-function invRow(v){
+function invRow(v,forceOpen){
   var cls = v.status==='pending' ? '' : ' class="done"';
   var warn = v.auto ? '' :
     ' <span class="hint" title="'+invEsc(v.ai_why||'авто-разбор не сработал — заполните вручную')+'">⚠</span>';
@@ -650,9 +716,14 @@ function invRow(v){
   if(v.status!=='pending')  act += '<button onclick="invStatus('+v.id+',\\'pending\\')">↩</button>';
   act += '<button onclick="invReparse('+v.id+')" title="переразобрать файл заново">🔄</button>';
   act += '<button onclick="invDelete('+v.id+')" title="удалить">🗑</button>';
+  var np = (v.positions||[]).length;
+  var open = forceOpen || !!INV_OPEN[v.id];
+  var car = '<button class="invexp" onclick="invToggle('+v.id+')" '
+    +'title="'+(np?('позиций: '+np):'нет позиций')+'">'+(open?'▾':'▸')+'</button>';
   return '<tr'+cls+'>'
     +'<td><button onclick="invOpenFile('+v.id+')" title="'+invEsc(v.file_name)+'">📄 Открыть</button>'+warn+'</td>'
-    +'<td><input class="ic" value="'+invEsc(v.contractor||'')+'" onchange="invEdit('+v.id+',\\'contractor\\',this)" style="min-width:340px"></td>'
+    +'<td class="cpar">'+car
+    +'<input class="ic" value="'+invEsc(v.contractor||'')+'" onchange="invEdit('+v.id+',\\'contractor\\',this)" style="min-width:300px"></td>'
     +'<td><input class="ic" value="'+invEsc(v.amount||'')+'" onchange="invEdit('+v.id+',\\'amount\\',this)" style="min-width:90px"></td>'
     +'<td><input class="ic" value="'+invEsc(v.date||'')+'" onchange="invEdit('+v.id+',\\'date\\',this)" style="min-width:90px"></td>'
     +'<td class="hint">'+invEsc(v.added_by||'')+'<br>'+invEsc(v.added_at||'')+'</td>'
@@ -669,10 +740,31 @@ function renderInvoices(){
   if(cc) cc.textContent='На одобрении: '+np+' · Одобрено: '+na+' · Отклонено: '+nr;
   var only=document.getElementById('invOnlyPending');
   if(only && only.checked) items=items.filter(function(x){return x.status==='pending';});
-  if(!items.length){ box.innerHTML='<div class="hint">Счетов пока нет.</div>'; return; }
+  var se=document.getElementById('invSearch');
+  var q=((se&&se.value)||'').trim().toLowerCase();
+  var hits=null;
+  if(q){
+    hits={};
+    items=items.filter(function(v){
+      var m=(v.contractor||'').toLowerCase().indexOf(q)>=0;
+      var pm=(v.positions||[]).some(function(p){return (p.name||'').toLowerCase().indexOf(q)>=0;});
+      if(pm) hits[v.id]=1;
+      return m||pm;
+    });
+  }
+  var si=document.getElementById('invSearchInfo');
+  if(si) si.textContent = q ? ('Найдено: '+items.length) : '';
+  if(!items.length){
+    box.innerHTML='<div class="hint">'+(q?'Ничего не найдено.':'Счетов пока нет.')+'</div>';
+    return;
+  }
   var h='<table><thead><tr><th>Файл</th><th>Контрагент</th><th>Сумма</th>'
     +'<th>Дата</th><th>От кого</th><th>Статус</th><th>Действия</th></tr></thead><tbody>';
-  items.forEach(function(v){ h+=invRow(v); });
+  items.forEach(function(v){
+    var ex = INV_OPEN[v.id] || (hits&&hits[v.id]);
+    h+=invRow(v,ex);
+    if(ex) h+=invDetail(v,q);
+  });
   box.innerHTML=h+'</tbody></table>';
 }
 async function loadInvoices(){
