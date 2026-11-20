@@ -452,6 +452,35 @@ def register(ctx):
                 save(store)
         return jsonify({"ok": True})
 
+    @app.post("/api/invoice_reparse")
+    def api_invoice_reparse():
+        """Переразобрать уже загруженный файл заново (файл лежит на сервере)."""
+        if not check_auth(request):
+            return jsonify({"error": "Неверный пароль"}), 401
+        iid = (request.get_json(force=True) or {}).get("id")
+        it = find(load()["items"], iid)
+        if not it:
+            return jsonify({"error": "Счёт не найден"}), 404
+        p = os.path.join(FILES_DIR, it["stored"])
+        if not os.path.exists(p):
+            return jsonify({"error": "Файл не найден на сервере"}), 404
+        with open(p, "rb") as f:
+            data = f.read()
+        res = analyze(data, it.get("mime") or "", it.get("file_name") or "")
+        with lock:
+            store = load()
+            cur = find(store["items"], iid)
+            if not cur:
+                return jsonify({"error": "Счёт не найден"}), 404
+            for k in ("contractor", "amount", "date"):
+                v = res.get(k)
+                if v:
+                    cur[k] = str(v)[:200]
+            cur["auto"] = res.get("is_invoice") is True
+            cur["ai_why"] = res.get("why", "")
+            save(store)
+        return jsonify({"ok": True, "invoice": cur})
+
     @app.get("/api/invoice_file/<int:iid>")
     def api_invoice_file(iid):
         if not check_auth(request):
@@ -542,6 +571,7 @@ def register(ctx):
   <div class="bar" style="margin-bottom:10px">
     <input type="file" id="invFile" style="display:none" onchange="invUpload(this)">
     <button onclick="document.getElementById('invFile').click()">⬆ Загрузить счёт вручную</button>
+    <button onclick="invReparseAll()" title="переразобрать все строки с ⚠ — файлы уже на сервере">🔄 Переразобрать нераспознанные</button>
     <label class="hint"><input type="checkbox" id="invOnlyPending" onchange="renderInvoices()"> только на одобрении</label>
     <span class="sp" style="flex:1"></span>
     <span class="hint" id="invCounts"></span>
@@ -594,6 +624,22 @@ async function invDelete(id){
   if(!confirm('Удалить счёт и файл безвозвратно?')) return;
   try{ await api('/api/invoice_delete',{id:id}); loadInvoices(); }catch(e){}
 }
+async function invReparse(id){
+  var cc=document.getElementById('invCounts'); if(cc) cc.textContent='Разбираю…';
+  try{ await api('/api/invoice_reparse',{id:id}); }catch(e){}
+  loadInvoices();
+}
+async function invReparseAll(){
+  var todo=INV_ITEMS.filter(function(x){return !x.auto;});
+  if(!todo.length){ alert('Нераспознанных файлов нет.'); return; }
+  if(!confirm('Переразобрать '+todo.length+' файл(ов) заново?')) return;
+  var cc=document.getElementById('invCounts');
+  for(var i=0;i<todo.length;i++){
+    if(cc) cc.textContent='Разбираю '+(i+1)+' из '+todo.length+'…';
+    try{ await api('/api/invoice_reparse',{id:todo[i].id}); }catch(e){}
+  }
+  loadInvoices();
+}
 function invRow(v){
   var cls = v.status==='pending' ? '' : ' class="done"';
   var warn = v.auto ? '' :
@@ -602,6 +648,7 @@ function invRow(v){
   if(v.status!=='approved') act += '<button onclick="invStatus('+v.id+',\\'approved\\')">✓ Одобрить</button>';
   if(v.status!=='rejected') act += '<button onclick="invStatus('+v.id+',\\'rejected\\')">✗ Отклонить</button>';
   if(v.status!=='pending')  act += '<button onclick="invStatus('+v.id+',\\'pending\\')">↩</button>';
+  act += '<button onclick="invReparse('+v.id+')" title="переразобрать файл заново">🔄</button>';
   act += '<button onclick="invDelete('+v.id+')" title="удалить">🗑</button>';
   return '<tr'+cls+'>'
     +'<td><button onclick="invOpenFile('+v.id+')" title="'+invEsc(v.file_name)+'">📄 Открыть</button>'+warn+'</td>'
