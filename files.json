@@ -4,5 +4,6 @@
   "mod_sales.py",
   "mod_bmw.py",
   "mod_backlog.py",
-  "mod_wheels.py"
+  "mod_wheels.py",
+  "mod_invoices.py"
 ]
