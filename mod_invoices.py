@@ -132,6 +132,48 @@ def register(ctx):
         return {"is_invoice": None, "contractor": "", "amount": "", "date": "",
                 "positions": [], "why": why}
 
+    def _loose(txt):
+        """Разбор ответа ИИ, устойчивый к обрыву JSON (много позиций)."""
+        res = {}
+
+        def g(key):
+            m = re.search(r'"' + key + r'"\s*:\s*"((?:[^"\\]|\\.)*)"', txt)
+            if not m:
+                return ""
+            try:
+                return json.loads('"' + m.group(1) + '"')
+            except Exception:
+                return m.group(1)
+
+        mi = re.search(r'"is_invoice"\s*:\s*(true|false)', txt)
+        res["is_invoice"] = (mi.group(1) == "true") if mi else None
+        for k in ("contractor", "amount", "date", "why"):
+            res[k] = g(k)
+        pm = re.search(r'"positions"\s*:\s*\[(.*)', txt, re.S)
+        pos = []
+        if pm:
+            for om in re.finditer(r'\{[^{}]*\}', pm.group(1)):
+                try:
+                    pos.append(json.loads(om.group(0)))
+                except Exception:
+                    pass
+        res["positions"] = pos
+        return res
+
+    def pdf_to_text(data):
+        """Текст из PDF (для текстовых счетов). None — если нет pypdf/текста."""
+        if not _ensure_mod("pypdf"):
+            return None
+        import io
+        import pypdf
+        try:
+            r = pypdf.PdfReader(io.BytesIO(data))
+            parts = [(p.extract_text() or "") for p in r.pages]
+            return "\n".join(parts)
+        except Exception as e:
+            warn(f"pdf read: {e}")
+            return None
+
     def _ensure_mod(name):
         try:
             __import__(name)
@@ -190,10 +232,15 @@ def register(ctx):
                 "data": base64.b64encode(data).decode()}},
                 {"type": "text", "text": PROMPT}]
         elif mime == "application/pdf" or low.endswith(".pdf") or data[:5] == b"%PDF-":
-            content = [{"type": "document", "source": {
-                "type": "base64", "media_type": "application/pdf",
-                "data": base64.b64encode(data).decode()}},
-                {"type": "text", "text": PROMPT}]
+            txt = pdf_to_text(data)
+            if txt and len(txt.strip()) >= 100:  # текстовый PDF — дешевле и без обрыва
+                content = [{"type": "text",
+                            "text": PROMPT + "\n\nТЕКСТ ИЗ PDF-СЧЁТА:\n" + txt[:30000]}]
+            else:  # скан/картинка — нативный разбор PDF моделью
+                content = [{"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf",
+                    "data": base64.b64encode(data).decode()}},
+                    {"type": "text", "text": PROMPT}]
         elif (low.endswith((".xls", ".xlsx", ".xlsm")) or "excel" in mime
               or "spreadsheet" in mime):
             txt = excel_to_text(data, filename)
@@ -209,14 +256,17 @@ def register(ctx):
             return _manual("авторазбор для этого файла недоступен — заполните поля вручную")
         try:
             msg = client.messages.create(
-                model=model, max_tokens=2000,
+                model=model, max_tokens=8000,
                 messages=[{"role": "user", "content": content}])
             if ctx.get("add_cost"):
                 ctx["add_cost"](msg)
             txt = (ctx["extract_text"](msg) if ctx.get("extract_text")
                    else "".join(getattr(x, "text", "") for x in msg.content))
             m = re.search(r"\{.*\}", txt, re.S)
-            res = json.loads(m.group(0)) if m else {}
+            try:
+                res = json.loads(m.group(0)) if m else {}
+            except Exception:
+                res = _loose(txt)  # ответ оборвался (много позиций) — спасаем что можем
         except Exception as e:
             return _manual(f"ИИ не смог разобрать ({e}) — заполните вручную")
         return {
